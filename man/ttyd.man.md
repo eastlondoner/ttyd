@@ -71,6 +71,9 @@ ttyd 1 "September 2016" ttyd "User Manual"
   -q, --exit-no-conn
       Exit on all clients disconnection
 
+  -Q, --shared-pty
+      Enable shared PTY mode (multiple clients share one terminal process)
+
   -B, --browser
       Open terminal with the default system browser
 
@@ -158,6 +161,55 @@ ttyd -p 8080 bash -x
   - If you want to login with your system accounts on the web browser, run `ttyd login`.
   - You can even run a non-shell command like vim, try: `ttyd vim`, the web browser will show you a vim editor.
   - Sharing single process with multiple clients: `ttyd tmux new -A -s ttyd vim`, run `tmux new -A -s ttyd` to connect to the tmux session from terminal.
+  - Collaborative terminal session (shared PTY mode): `ttyd -Q -W bash`, all connected clients will share the same terminal process and see real-time output.
+
+# SHARED PTY MODE
+  The `--shared-pty` (`-Q`) flag enables multiple WebSocket clients to connect to a single shared PTY process, similar to tmux/screen over the web.
+
+## Usage
+```bash
+ttyd --shared-pty bash
+```
+
+  All connected clients will:
+
+  - See the same output in real-time
+  - Share input when writable mode is enabled (use `-W` flag)
+  - Share the same terminal dimensions (uses maximum dimensions from all clients)
+  - Disconnect when the process exits
+
+## Use Cases
+  - Live coding demonstrations and presentations
+  - Collaborative debugging sessions
+  - Remote pair programming
+  - Real-time terminal sharing without tmux/screen
+
+## Limitations
+  - URL arguments (`-a` flag) are not supported in shared mode (server config only)
+  - All clients share the same environment (first client's user for `TTYD_USER`)
+  - Multiple simultaneous writers can create confusing input
+  - Terminal is sized to accommodate the largest client window
+
+## Best Practices
+  - Coordinate who types using external communication (voice chat, etc.)
+  - Use read-only mode (default) for presentations and demos
+  - Enable writable mode (`-W`) only for trusted collaborators
+  - First client to connect determines initial environment and user
+
+## Examples
+```bash
+# Read-only shared session for demonstrations
+ttyd -Q bash
+
+# Writable shared session for collaboration
+ttyd -Q -W bash
+
+# Shared session with authentication
+ttyd -Q -W -c admin:password bash
+
+# One-shot shared demo (exit after process completes)
+ttyd -Q -o python demo.py
+```
 
 # SSL how-to
   Generate SSL CA and self signed server/client certificates:
