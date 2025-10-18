@@ -193,6 +193,36 @@ static void queue_session_resize_for_client(struct pss_tty *pss, uint16_t cols, 
   lws_callback_on_writable(pss->wsi);
 }
 
+static void flush_pending_session_resize(struct server *server, struct pss_tty *pss, struct lws *wsi) {
+  if (server == NULL || pss == NULL || wsi == NULL) return;
+  if (!server->shared_pty_mode || !pss->pending_session_resize) return;
+
+  json_object *resize = json_object_new_object();
+  json_object_object_add(resize, "columns", json_object_new_int(pss->pending_session_columns));
+  json_object_object_add(resize, "rows", json_object_new_int(pss->pending_session_rows));
+
+  const char *json_str = json_object_to_json_string(resize);
+  size_t json_len = strlen(json_str);
+  unsigned char *message = xmalloc(LWS_PRE + 1 + json_len);
+  unsigned char *p = &message[LWS_PRE];
+  p[0] = SESSION_RESIZE;
+  memcpy(p + 1, json_str, json_len);
+
+  int written = lws_write(wsi, p, 1 + json_len, LWS_WRITE_BINARY);
+  if (written < 0) {
+    lwsl_err("failed to send session resize to client %s\n", pss->address);
+  } else {
+    lwsl_notice("Sent session resize %dx%d to client %s\n",
+                pss->pending_session_columns,
+                pss->pending_session_rows,
+                pss->address);
+  }
+
+  free(message);
+  json_object_put(resize);
+  pss->pending_session_resize = false;
+}
+
 static void broadcast_session_resize(struct server *server, uint16_t cols, uint16_t rows) {
   if (server->client_wsi_list == NULL) return;
 
@@ -605,16 +635,19 @@ static void tsm_log_cb(void *data, const char *file, int line, const char *fn,
 
 // libtsm write callback - sends data back to PTY (e.g., for responses to queries)
 static void tsm_write_cb(struct tsm_vte *vte, const char *u8, size_t len, void *data) {
-  struct server *server = (struct server *)data;
-
-  // Write response back to PTY if needed (e.g., terminal query responses)
-  if (server->shared_process != NULL && u8 != NULL && len > 0) {
-    pty_buf_t *buf = pty_buf_init((char *)u8, len);
-    int err = pty_write(server->shared_process, buf);
-    if (err != 0) {
-      lwsl_err("Failed to write TSM response to PTY: %s\n", uv_strerror(err));
-    }
-  }
+  // NOTE: We intentionally do NOT write VTE responses back to the PTY.
+  // libtsm is only used server-side for snapshot generation, not for terminal emulation.
+  // The actual terminal emulation happens in the browser via xterm.js.
+  //
+  // If we wrote VTE responses (e.g., OSC color query responses like "10;rgb:d2d2/d2d2/d2d2")
+  // back to the PTY, they would get broadcast to all connected clients, causing weird
+  // escape sequences to appear in everyone's terminal.
+  //
+  // Therefore, this callback is intentionally a no-op.
+  (void)vte;
+  (void)u8;
+  (void)len;
+  (void)data;
 }
 
 // Initialize libtsm screen and VTE for snapshot support
@@ -1048,6 +1081,16 @@ int callback_tty(struct lws *wsi, enum lws_callback_reasons reason, void *user, 
         if (!server->shared_pty_mode && pss->process != NULL) {
           pty_resume(pss->process);
         }
+
+        // Send any pending session resize to the newly initialized client
+        if (server->shared_pty_mode && pss->pending_session_resize) {
+          flush_pending_session_resize(server, pss, wsi);
+        }
+
+        // Queue another writable callback if there's PTY data waiting
+        if (pss->pty_buf != NULL) {
+          lws_callback_on_writable(wsi);
+        }
         break;
       }
 
@@ -1056,31 +1099,14 @@ int callback_tty(struct lws *wsi, enum lws_callback_reasons reason, void *user, 
         return 1;
       }
 
+      // Handle any pending session resize for already-initialized clients
       if (server->shared_pty_mode && pss->pending_session_resize) {
-        json_object *resize = json_object_new_object();
-        json_object_object_add(resize, "columns", json_object_new_int(pss->pending_session_columns));
-        json_object_object_add(resize, "rows", json_object_new_int(pss->pending_session_rows));
-
-        const char *json_str = json_object_to_json_string(resize);
-        size_t json_len = strlen(json_str);
-        unsigned char *message = xmalloc(LWS_PRE + 1 + json_len);
-        unsigned char *p = &message[LWS_PRE];
-        p[0] = SESSION_RESIZE;
-        memcpy(p + 1, json_str, json_len);
-
-        int written = lws_write(wsi, p, 1 + json_len, LWS_WRITE_BINARY);
-        if (written < 0) {
-          lwsl_err("failed to send session resize to client %s\n", pss->address);
-        } else {
-          lwsl_notice("Sent session resize %dx%d to client %s\n",
-                      pss->pending_session_columns,
-                      pss->pending_session_rows,
-                      pss->address);
+        flush_pending_session_resize(server, pss, wsi);
+        // Queue another writable callback if there's PTY data waiting
+        if (pss->pty_buf != NULL) {
+          lws_callback_on_writable(wsi);
         }
-
-        free(message);
-        json_object_put(resize);
-        pss->pending_session_resize = false;
+        break;
       }
 
       if (pss->pty_buf != NULL) {
