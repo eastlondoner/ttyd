@@ -4,6 +4,9 @@
 
 #include "pty.h"
 
+// libtsm - Terminal State Machine for snapshots
+#include <libtsm.h>
+
 // client message
 #define INPUT '0'
 #define RESIZE_TERMINAL '1'
@@ -15,6 +18,8 @@
 #define OUTPUT '0'
 #define SET_WINDOW_TITLE '1'
 #define SET_PREFERENCES '2'
+#define SNAPSHOT '3'
+#define SESSION_RESIZE '4'
 
 // url paths
 struct endpoints {
@@ -58,8 +63,11 @@ struct pss_tty {
   // NEW: Client tracking for shared mode
   bool is_primary_client;      // Is this the first/controlling client?
   int client_index;            // Index in server->client_wsi_list (-1 if not in list)
-  uint16_t requested_columns;  // For max-dimension strategy
+  uint16_t requested_columns;  // Last reported geometry from this client
   uint16_t requested_rows;
+  bool pending_session_resize;     // Whether a session-wide resize needs to be sent
+  uint16_t pending_session_columns;
+  uint16_t pending_session_rows;
 };
 
 typedef struct {
@@ -98,7 +106,13 @@ struct server {
   struct lws **client_wsi_list;   // Dynamic array of active WebSocket connections
   int client_wsi_capacity;        // Capacity of the array
   int active_client_count;        // Number of active clients in shared mode
-  uint16_t primary_columns;       // Terminal size from primary client
-  uint16_t primary_rows;
+  uint16_t session_columns;       // Session-wide terminal size (narrowest policy)
+  uint16_t session_rows;
   char *first_client_user;        // Username of first authenticated client (for TTYD_USER)
+
+  // NEW: libtsm snapshot support (only used in shared_pty_mode)
+  struct tsm_screen *tsm_screen;  // Terminal screen state machine
+  struct tsm_vte *tsm_vte;        // VT100 emulator
+  int scrollback_size;            // Scrollback buffer size (default: 2000)
+  bool snapshot_enabled;          // Whether to send snapshots to new clients
 };

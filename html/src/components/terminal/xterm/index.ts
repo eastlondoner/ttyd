@@ -28,6 +28,8 @@ enum Command {
     OUTPUT = '0',
     SET_WINDOW_TITLE = '1',
     SET_PREFERENCES = '2',
+    SNAPSHOT = '3',
+    SESSION_RESIZE = '4',
 
     // client side
     INPUT = '0',
@@ -101,6 +103,9 @@ export class Xterm {
     private reconnect = true;
     private doReconnect = true;
     private closeOnDisconnect = false;
+    private sessionCols?: number;
+    private sessionRows?: number;
+    private suppressClientResize = false;
 
     private writeFunc = (data: ArrayBuffer) => this.writeData(new Uint8Array(data));
 
@@ -183,6 +188,17 @@ export class Xterm {
         register(terminal.onBinary(data => sendData(Uint8Array.from(data, v => v.charCodeAt(0)))));
         register(
             terminal.onResize(({ cols, rows }) => {
+                if (this.suppressClientResize) {
+                    return;
+                }
+
+                if (this.sessionCols !== undefined && this.sessionRows !== undefined) {
+                    if (cols > this.sessionCols || rows > this.sessionRows) {
+                        this.forceSessionGeometry(this.sessionCols, this.sessionRows);
+                        return;
+                    }
+                }
+
                 const msg = JSON.stringify({ columns: cols, rows: rows });
                 this.socket?.send(this.textEncoder.encode(Command.RESIZE_TERMINAL + msg));
                 if (this.resizeOverlay) overlayAddon.showOverlay(`${cols}x${rows}`, 300);
@@ -361,6 +377,12 @@ export class Xterm {
                     ...this.parseOptsFromUrlQuery(window.location.search),
                 } as Preferences);
                 break;
+            case Command.SNAPSHOT:
+                this.applySnapshot(textDecoder.decode(data));
+                break;
+            case Command.SESSION_RESIZE:
+                this.applySessionResize(textDecoder.decode(data));
+                break;
             default:
                 console.warn(`[ttyd] unknown command: ${cmd}`);
                 break;
@@ -465,6 +487,100 @@ export class Xterm {
                     if (key.indexOf('font') === 0) fitAddon.fit();
                     break;
             }
+        }
+    }
+
+    @bind
+    private forceSessionGeometry(cols: number, rows: number) {
+        if (!this.terminal) {
+            return;
+        }
+
+        if (!Number.isFinite(cols) || !Number.isFinite(rows)) {
+            return;
+        }
+
+        const targetCols = Math.max(1, Math.floor(cols));
+        const targetRows = Math.max(1, Math.floor(rows));
+
+        if (this.terminal.cols === targetCols && this.terminal.rows === targetRows) {
+            return;
+        }
+
+        this.suppressClientResize = true;
+        try {
+            this.terminal.resize(targetCols, targetRows);
+        } finally {
+            this.suppressClientResize = false;
+        }
+
+        if (this.resizeOverlay) {
+            this.overlayAddon.showOverlay(`${targetCols}x${targetRows}`, 300);
+        }
+    }
+
+    @bind
+    private applySessionResize(jsonData: string) {
+        let payload: { columns?: number; rows?: number };
+        try {
+            payload = JSON.parse(jsonData);
+        } catch (e) {
+            console.warn('[ttyd] failed to parse session resize payload', e);
+            return;
+        }
+
+        const { columns, rows } = payload;
+        if (!Number.isFinite(columns) || !Number.isFinite(rows)) {
+            console.warn('[ttyd] invalid session resize payload', payload);
+            return;
+        }
+
+        const width = Math.max(1, Math.floor(columns!));
+        const height = Math.max(1, Math.floor(rows!));
+
+        if (this.sessionCols === width && this.sessionRows === height) {
+            if (this.terminal && this.terminal.cols === width && this.terminal.rows === height) {
+                return;
+            }
+        }
+
+        this.sessionCols = width;
+        this.sessionRows = height;
+        this.forceSessionGeometry(width, height);
+    }
+
+    @bind
+    private applySnapshot(jsonData: string) {
+        const { terminal } = this;
+
+        try {
+            const snapshot = JSON.parse(jsonData);
+            console.log(
+                `[ttyd] received snapshot: ${snapshot.lines.length} lines, cursor at (${snapshot.cursor_x},${snapshot.cursor_y})`
+            );
+
+            // Use proper ANSI sequences to render the snapshot
+            // This ensures the terminal stays in a proper state for control sequences
+
+            // Clear screen and move cursor to home: ESC[2J ESC[H
+            terminal.write('\x1b[2J\x1b[H');
+
+            // Write each line with proper ANSI positioning
+            for (let i = 0; i < snapshot.lines.length; i++) {
+                if (snapshot.lines[i].length > 0) {
+                    // Position cursor at start of line (row is 1-indexed): ESC[row;1H
+                    terminal.write(`\x1b[${i + 1};1H${snapshot.lines[i]}`);
+                }
+            }
+
+            // Position cursor at the saved position (1-indexed): ESC[row;colH
+            const row = snapshot.cursor_y + 1;
+            const col = snapshot.cursor_x + 1;
+            terminal.write(`\x1b[${row};${col}H`);
+
+            console.log('[ttyd] snapshot applied successfully');
+        } catch (e) {
+            console.error('[ttyd] failed to apply snapshot:', e);
         }
     }
 

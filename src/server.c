@@ -173,6 +173,13 @@ static struct server *server_new(int argc, char **argv, int start) {
   ts->sig_code = SIGHUP;
   sprintf(ts->terminal_type, "%s", "xterm-256color");
   get_sig_name(ts->sig_code, ts->sig_name, sizeof(ts->sig_name));
+
+  // Initialize libtsm snapshot settings
+  ts->scrollback_size = 2000;  // Default scrollback: 2000 lines
+  ts->snapshot_enabled = true;  // Enable snapshots by default in shared mode
+  ts->tsm_screen = NULL;
+  ts->tsm_vte = NULL;
+
   if (start == argc) return ts;
 
   int cmd_argc = argc - start;
@@ -238,6 +245,16 @@ static void server_free(struct server *ts) {
   if (ts->first_client_user != NULL) {
     free(ts->first_client_user);
     ts->first_client_user = NULL;
+  }
+
+  // Clean up libtsm resources
+  if (ts->tsm_vte != NULL) {
+    tsm_vte_unref(ts->tsm_vte);
+    ts->tsm_vte = NULL;
+  }
+  if (ts->tsm_screen != NULL) {
+    tsm_screen_unref(ts->tsm_screen);
+    ts->tsm_screen = NULL;
   }
 
   uv_loop_close(ts->loop);

@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 
 #include "pty.h"
 #include "server.h"
@@ -77,6 +78,10 @@ static inline struct pss_tty *get_pss_from_wsi(struct lws *wsi) {
   return (struct pss_tty *)lws_wsi_user(wsi);
 }
 
+static void queue_session_resize_for_client(struct pss_tty *pss, uint16_t cols, uint16_t rows);
+static void broadcast_session_resize(struct server *server, uint16_t cols, uint16_t rows);
+static void update_shared_session_geometry(struct server *server);
+
 static void add_client_to_list(struct server *server, struct lws *wsi) {
   // Resize array if needed (start at 8, double when full)
   if (server->active_client_count >= server->client_wsi_capacity) {
@@ -148,8 +153,13 @@ static void remove_client_from_list(struct server *server, struct lws *wsi) {
 
   pss->client_index = -1;
   pss->is_primary_client = false;
+  pss->requested_columns = 0;
+  pss->requested_rows = 0;
+  pss->pending_session_resize = false;
 
   if (server->active_client_count == 0) {
+    server->session_columns = 0;
+    server->session_rows = 0;
     if (server->shared_process != NULL && (server->exit_no_conn || server->once)) {
       lwsl_notice("No clients remaining, killing shared process\n");
       pty_kill(server->shared_process, server->sig_code);
@@ -162,7 +172,110 @@ static void remove_client_from_list(struct server *server, struct lws *wsi) {
       lws_cancel_service(context);
       exit(0);
     }
+  } else {
+    update_shared_session_geometry(server);
   }
+}
+
+static void queue_session_resize_for_client(struct pss_tty *pss, uint16_t cols, uint16_t rows) {
+  if (pss == NULL || pss->wsi == NULL) return;
+  if (cols == 0 || rows == 0) return;
+
+  if (pss->pending_session_resize &&
+      pss->pending_session_columns == cols &&
+      pss->pending_session_rows == rows) {
+    return;
+  }
+
+  pss->pending_session_resize = true;
+  pss->pending_session_columns = cols;
+  pss->pending_session_rows = rows;
+  lws_callback_on_writable(pss->wsi);
+}
+
+static void broadcast_session_resize(struct server *server, uint16_t cols, uint16_t rows) {
+  if (server->client_wsi_list == NULL) return;
+
+  for (int i = 0; i < server->client_wsi_capacity; i++) {
+    if (server->client_wsi_list[i] != NULL) {
+      struct pss_tty *pss = get_pss_from_wsi(server->client_wsi_list[i]);
+      queue_session_resize_for_client(pss, cols, rows);
+    }
+  }
+}
+
+static void update_shared_session_geometry(struct server *server) {
+  if (server == NULL || !server->shared_pty_mode) return;
+  if (server->active_client_count <= 0) return;
+
+  uint16_t min_cols = UINT16_MAX;
+  uint16_t min_rows = UINT16_MAX;
+  bool have_cols = false;
+  bool have_rows = false;
+
+  for (int i = 0; i < server->client_wsi_capacity; i++) {
+    if (server->client_wsi_list[i] == NULL) continue;
+    struct pss_tty *pss = get_pss_from_wsi(server->client_wsi_list[i]);
+    if (pss == NULL) continue;
+
+    if (pss->requested_columns > 0) {
+      if (!have_cols || pss->requested_columns < min_cols) {
+        min_cols = pss->requested_columns;
+      }
+      have_cols = true;
+    }
+
+    if (pss->requested_rows > 0) {
+      if (!have_rows || pss->requested_rows < min_rows) {
+        min_rows = pss->requested_rows;
+      }
+      have_rows = true;
+    }
+  }
+
+  if (!have_cols || !have_rows) {
+    lwsl_debug("Shared session geometry pending: cols_present=%d rows_present=%d\n",
+               (int)have_cols, (int)have_rows);
+    return;
+  }
+
+  bool changed = (min_cols != server->session_columns) || (min_rows != server->session_rows);
+  if (!changed) {
+    return;
+  }
+
+  lwsl_notice("Updating shared session geometry to %dx%d (narrowest clients)\n", min_cols, min_rows);
+
+  server->session_columns = min_cols;
+  server->session_rows = min_rows;
+
+  if (server->shared_process != NULL) {
+    bool resized = pty_resize_set(server->shared_process, min_cols, min_rows);
+    if (!resized) {
+      lwsl_err("Failed to resize shared PTY to %dx%d\n", min_cols, min_rows);
+    } else {
+      server->shared_process->columns = min_cols;
+      server->shared_process->rows = min_rows;
+    }
+  }
+
+  if (server->tsm_screen != NULL) {
+    int ret = tsm_screen_resize(server->tsm_screen, min_cols, min_rows);
+    if (ret < 0) {
+      lwsl_err("Failed to resize tsm_screen to %dx%d: %d\n", min_cols, min_rows, ret);
+    } else {
+      unsigned int cursor_x = tsm_screen_get_cursor_x(server->tsm_screen);
+      unsigned int cursor_y = tsm_screen_get_cursor_y(server->tsm_screen);
+      unsigned int new_x = cursor_x < min_cols ? cursor_x : (min_cols > 0 ? min_cols - 1 : 0);
+      unsigned int new_y = cursor_y < min_rows ? cursor_y : (min_rows > 0 ? min_rows - 1 : 0);
+      if (cursor_x != new_x || cursor_y != new_y) {
+        tsm_screen_move_to(server->tsm_screen, new_x, new_y);
+      }
+      lwsl_debug("Resized tsm_screen to %dx%d\n", min_cols, min_rows);
+    }
+  }
+
+  broadcast_session_resize(server, min_cols, min_rows);
 }
 
 static pty_ctx_t *pty_ctx_init(struct pss_tty *pss) {
@@ -212,6 +325,15 @@ static void shared_process_exit_cb(pty_process *process);
 static char **build_args_from_server(struct server *server);
 static char **build_env_from_server(struct server *server);
 
+// libtsm helpers for snapshot support
+static void tsm_log_cb(void *data, const char *file, int line, const char *fn,
+                       const char *subs, unsigned int sev, const char *format,
+                       va_list args);
+static void tsm_write_cb(struct tsm_vte *vte, const char *u8, size_t len, void *data);
+static bool init_tsm_screen(struct server *server, uint16_t columns, uint16_t rows);
+static void cleanup_tsm_screen(struct server *server);
+static char *serialize_snapshot(struct server *server, uint16_t cols, uint16_t rows);
+
 // Create shared PTY process (called for first client only)
 static bool create_shared_process(struct server *server, struct pss_tty *first_pss,
                                    uint16_t columns, uint16_t rows) {
@@ -260,8 +382,14 @@ static bool create_shared_process(struct server *server, struct pss_tty *first_p
   }
 
   server->shared_process = process;
-  server->primary_columns = columns;
-  server->primary_rows = rows;
+  server->session_columns = columns;
+  server->session_rows = rows;
+
+  // Initialize libtsm screen for snapshots (if enabled)
+  if (!init_tsm_screen(server, columns, rows)) {
+    lwsl_err("Failed to initialize libtsm screen, snapshots will be disabled\n");
+    server->snapshot_enabled = false;
+  }
 
   lwsl_notice("Shared PTY process created (PID: %d, size: %dx%d)\n",
               process->pid, columns, rows);
@@ -293,6 +421,12 @@ static void shared_process_read_cb(pty_process *process, pty_buf_t *buf, bool eo
     return;
   }
 
+  // Feed PTY output to libtsm VTE for snapshot support
+  if (server->tsm_vte != NULL && buf->base != NULL && buf_len > 0) {
+    tsm_vte_input(server->tsm_vte, buf->base, buf_len);
+    lwsl_debug("Fed %zu bytes to libtsm VTE\n", buf_len);
+  }
+
   // Broadcast to ALL connected clients using reference counting
   for (int i = 0; i < server->client_wsi_capacity; i++) {
     if (server->client_wsi_list[i] != NULL) {
@@ -319,9 +453,6 @@ static void shared_process_read_cb(pty_process *process, pty_buf_t *buf, bool eo
   pty_buf_release(buf);
   lwsl_debug("Broadcast %zu bytes to %d clients\n", buf_len, delivered);
 
-  if (server->active_client_count > 0) {
-    pty_resume(process);
-  }
 }
 
 // Handle shared PTY process exit - affects all clients
@@ -365,8 +496,13 @@ static void shared_process_exit_cb(pty_process *process) {
 
   lwsl_notice("Closing %d client connections\n", closed);
 
+  // Clean up libtsm screen and VTE
+  cleanup_tsm_screen(server);
+
   // Clean up shared process
   server->shared_process = NULL;  // Clear before freeing to prevent race
+  server->session_columns = 0;
+  server->session_rows = 0;
   server->active_client_count = 0;
 
   // Exit server if -o (once) flag is set
@@ -452,6 +588,302 @@ static char **build_env_from_server(struct server *server) {
   envp[i] = NULL;
 
   return envp;
+}
+
+// libtsm logging callback
+static void tsm_log_cb(void *data, const char *file, int line, const char *fn,
+                       const char *subs, unsigned int sev, const char *format,
+                       va_list args) {
+  // Forward libtsm logs to lwsl
+  // Severity: 0=debug, 1=info, 2=notice, 3=warning, 4=error, 5=critical, 6=alert, 7=fatal
+  if (sev >= 3) {  // Only log warnings and above
+    lwsl_warn("libtsm: ");
+    vfprintf(stderr, format, args);
+    fprintf(stderr, "\n");
+  }
+}
+
+// libtsm write callback - sends data back to PTY (e.g., for responses to queries)
+static void tsm_write_cb(struct tsm_vte *vte, const char *u8, size_t len, void *data) {
+  struct server *server = (struct server *)data;
+
+  // Write response back to PTY if needed (e.g., terminal query responses)
+  if (server->shared_process != NULL && u8 != NULL && len > 0) {
+    pty_buf_t *buf = pty_buf_init((char *)u8, len);
+    int err = pty_write(server->shared_process, buf);
+    if (err != 0) {
+      lwsl_err("Failed to write TSM response to PTY: %s\n", uv_strerror(err));
+    }
+  }
+}
+
+// Initialize libtsm screen and VTE for snapshot support
+static bool init_tsm_screen(struct server *server, uint16_t columns, uint16_t rows) {
+  if (!server->snapshot_enabled) {
+    return true;  // Snapshots disabled, skip initialization
+  }
+
+  // Create screen
+  int ret = tsm_screen_new(&server->tsm_screen, tsm_log_cb, server);
+  if (ret < 0) {
+    lwsl_err("Failed to create tsm_screen: %d\n", ret);
+    return false;
+  }
+
+  // Set scrollback limit
+  tsm_screen_set_max_sb(server->tsm_screen, server->scrollback_size);
+
+  // Resize screen to match terminal
+  ret = tsm_screen_resize(server->tsm_screen, columns, rows);
+  if (ret < 0) {
+    lwsl_err("Failed to resize tsm_screen: %d\n", ret);
+    tsm_screen_unref(server->tsm_screen);
+    server->tsm_screen = NULL;
+    return false;
+  }
+
+  // Create VTE
+  ret = tsm_vte_new(&server->tsm_vte, server->tsm_screen, tsm_write_cb, server, tsm_log_cb, server);
+  if (ret < 0) {
+    lwsl_err("Failed to create tsm_vte: %d\n", ret);
+    tsm_screen_unref(server->tsm_screen);
+    server->tsm_screen = NULL;
+    return false;
+  }
+
+  lwsl_notice("Initialized libtsm screen: %dx%d, scrollback: %d lines\n",
+              columns, rows, server->scrollback_size);
+
+  return true;
+}
+
+// Cleanup libtsm screen and VTE
+static void cleanup_tsm_screen(struct server *server) {
+  if (server->tsm_vte != NULL) {
+    tsm_vte_unref(server->tsm_vte);
+    server->tsm_vte = NULL;
+  }
+
+  if (server->tsm_screen != NULL) {
+    tsm_screen_unref(server->tsm_screen);
+    server->tsm_screen = NULL;
+  }
+
+  lwsl_debug("Cleaned up libtsm screen\n");
+}
+
+// Context for tsm_screen_draw callback
+struct snapshot_ctx {
+  json_object *lines_array;
+  char **line_bufs;          // Array of line buffers (one per row) with ANSI codes
+  unsigned int *line_pos;    // Current position in each line (for padding)
+  struct tsm_screen_attr *last_attr; // Track last attributes per line for SGR optimization
+  unsigned int width;
+  unsigned int height;
+};
+
+// Helper: Compare two attributes to see if SGR codes need to change
+static bool attrs_equal(const struct tsm_screen_attr *a, const struct tsm_screen_attr *b) {
+  if (a == NULL || b == NULL) return false;
+  return a->fccode == b->fccode && a->bccode == b->bccode &&
+         a->bold == b->bold && a->italic == b->italic &&
+         a->underline == b->underline && a->inverse == b->inverse &&
+         a->blink == b->blink;
+}
+
+// Helper: Append ANSI SGR codes to buffer based on attributes
+static void append_sgr(char *buf, size_t *len, const struct tsm_screen_attr *attr,
+                       const struct tsm_screen_attr *last) {
+  // If attrs haven't changed, do nothing
+  if (attrs_equal(attr, last)) return;
+
+  // Reset to default first if switching attributes
+  if (last != NULL) {
+    buf[(*len)++] = '\x1b';
+    buf[(*len)++] = '[';
+    buf[(*len)++] = '0';
+    buf[(*len)++] = 'm';
+  }
+
+  // Apply new attributes
+  buf[(*len)++] = '\x1b';
+  buf[(*len)++] = '[';
+  bool first = true;
+
+  if (attr->bold) {
+    *len += snprintf(buf + *len, 16, "%s1", first ? "" : ";");
+    first = false;
+  }
+  if (attr->italic) {
+    *len += snprintf(buf + *len, 16, "%s3", first ? "" : ";");
+    first = false;
+  }
+  if (attr->underline) {
+    *len += snprintf(buf + *len, 16, "%s4", first ? "" : ";");
+    first = false;
+  }
+  if (attr->blink) {
+    *len += snprintf(buf + *len, 16, "%s5", first ? "" : ";");
+    first = false;
+  }
+  if (attr->inverse) {
+    *len += snprintf(buf + *len, 16, "%s7", first ? "" : ";");
+    first = false;
+  }
+
+  // Foreground color (30-37 for standard, 90-97 for bright)
+  if (attr->fccode >= 0 && attr->fccode < 16) {
+    int fg = attr->fccode < 8 ? 30 + attr->fccode : 90 + (attr->fccode - 8);
+    *len += snprintf(buf + *len, 16, "%s%d", first ? "" : ";", fg);
+    first = false;
+  }
+
+  // Background color (40-47 for standard, 100-107 for bright)
+  if (attr->bccode >= 0 && attr->bccode < 16) {
+    int bg = attr->bccode < 8 ? 40 + attr->bccode : 100 + (attr->bccode - 8);
+    *len += snprintf(buf + *len, 16, "%s%d", first ? "" : ";", bg);
+    first = false;
+  }
+
+  if (first) {
+    // No attributes set, just reset
+    buf[(*len)++] = '0';
+  }
+
+  buf[(*len)++] = 'm';
+}
+
+// Callback for tsm_screen_draw - accumulates characters with ANSI formatting
+static int snapshot_draw_cb(struct tsm_screen *con, uint64_t id,
+                            const uint32_t *ch, size_t len,
+                            unsigned int width, unsigned int posx,
+                            unsigned int posy, const struct tsm_screen_attr *attr,
+                            tsm_age_t age, void *data) {
+  struct snapshot_ctx *ctx = (struct snapshot_ctx *)data;
+
+  if (posy >= ctx->height || posx >= ctx->width) return 0;
+
+  // Ensure line buffer exists (with extra space for ANSI codes)
+  if (ctx->line_bufs[posy] == NULL) {
+    ctx->line_bufs[posy] = xmalloc(ctx->width * 32);  // Much larger for ANSI codes
+    ctx->line_bufs[posy][0] = '\0';
+    ctx->line_pos[posy] = 0;
+  }
+
+  char *line = ctx->line_bufs[posy];
+  size_t line_len = strlen(line);
+
+  // Pad with spaces if there's a gap before this cell position
+  while (ctx->line_pos[posy] < posx && ctx->line_pos[posy] < ctx->width) {
+    line[line_len++] = ' ';
+    ctx->line_pos[posy]++;
+  }
+
+  // Emit SGR codes if attributes changed
+  append_sgr(line, &line_len, attr, &ctx->last_attr[posy]);
+  ctx->last_attr[posy] = *attr;
+
+  // Write the character(s) at this position
+  for (size_t i = 0; i < len && ctx->line_pos[posy] < ctx->width; i++) {
+    uint32_t codepoint = ch[i];
+    if (codepoint == 0) codepoint = ' ';
+
+    // Convert Unicode codepoint to UTF-8
+    if (codepoint < 0x80) {
+      line[line_len++] = (char)codepoint;
+    } else if (codepoint < 0x800) {
+      line[line_len++] = (char)(0xC0 | (codepoint >> 6));
+      line[line_len++] = (char)(0x80 | (codepoint & 0x3F));
+    } else if (codepoint < 0x10000) {
+      line[line_len++] = (char)(0xE0 | (codepoint >> 12));
+      line[line_len++] = (char)(0x80 | ((codepoint >> 6) & 0x3F));
+      line[line_len++] = (char)(0x80 | (codepoint & 0x3F));
+    } else {
+      line[line_len++] = (char)(0xF0 | (codepoint >> 18));
+      line[line_len++] = (char)(0x80 | ((codepoint >> 12) & 0x3F));
+      line[line_len++] = (char)(0x80 | ((codepoint >> 6) & 0x3F));
+      line[line_len++] = (char)(0x80 | (codepoint & 0x3F));
+    }
+  }
+
+  line[line_len] = '\0';
+
+  // Advance position by the reported width (handles double-width chars)
+  ctx->line_pos[posy] += width;
+
+  return 0;
+}
+
+// Serialize terminal snapshot to JSON
+static char *serialize_snapshot(struct server *server, uint16_t cols, uint16_t rows) {
+  if (server->tsm_screen == NULL) {
+    return NULL;
+  }
+
+  // Get cursor position
+  unsigned int cursor_x = tsm_screen_get_cursor_x(server->tsm_screen);
+  unsigned int cursor_y = tsm_screen_get_cursor_y(server->tsm_screen);
+
+  // Get terminal dimensions from screen
+  unsigned int screen_width = tsm_screen_get_width(server->tsm_screen);
+  unsigned int screen_height = tsm_screen_get_height(server->tsm_screen);
+
+  // Use requested dimensions if provided, otherwise use screen dimensions
+  if (cols == 0) cols = screen_width;
+  if (rows == 0) rows = screen_height;
+
+  lwsl_debug("Serializing snapshot: screen=%ux%u, requested=%ux%u, cursor=%u,%u\n",
+             screen_width, screen_height, cols, rows, cursor_x, cursor_y);
+
+  // Prepare snapshot context
+  struct snapshot_ctx ctx;
+  ctx.lines_array = json_object_new_array();
+  ctx.width = cols;
+  ctx.height = rows;
+  ctx.line_bufs = calloc(rows, sizeof(char *));
+  ctx.line_pos = calloc(rows, sizeof(unsigned int));
+  ctx.last_attr = calloc(rows, sizeof(struct tsm_screen_attr));
+
+  // Use tsm_screen_draw to extract screen content
+  tsm_screen_draw(server->tsm_screen, snapshot_draw_cb, &ctx);
+
+  // Build JSON array from line buffers (with ANSI codes included)
+  for (unsigned int i = 0; i < rows; i++) {
+    if (ctx.line_bufs[i] != NULL) {
+      // Don't trim trailing spaces as they might be after ANSI codes
+      // Add a reset at the end of each line to prevent bleed-over
+      size_t len = strlen(ctx.line_bufs[i]);
+      ctx.line_bufs[i] = realloc(ctx.line_bufs[i], len + 5);  // Room for \x1b[0m
+      strcpy(ctx.line_bufs[i] + len, "\x1b[0m");
+
+      json_object_array_add(ctx.lines_array, json_object_new_string(ctx.line_bufs[i]));
+      free(ctx.line_bufs[i]);
+    } else {
+      json_object_array_add(ctx.lines_array, json_object_new_string(""));
+    }
+  }
+  free(ctx.line_bufs);
+  free(ctx.line_pos);
+  free(ctx.last_attr);
+
+  // Build snapshot JSON
+  json_object *snapshot = json_object_new_object();
+  json_object_object_add(snapshot, "lines", ctx.lines_array);
+  json_object_object_add(snapshot, "cursor_x", json_object_new_int(cursor_x));
+  json_object_object_add(snapshot, "cursor_y", json_object_new_int(cursor_y));
+  json_object_object_add(snapshot, "width", json_object_new_int(cols));
+  json_object_object_add(snapshot, "height", json_object_new_int(rows));
+
+  // Convert to string
+  const char *json_str = json_object_to_json_string(snapshot);
+  char *result = strdup(json_str);
+
+  // Clean up
+  json_object_put(snapshot);
+
+  lwsl_debug("Snapshot serialized: %zu bytes, %u lines\n", strlen(result), rows);
+
+  return result;
 }
 
 static bool spawn_process(struct pss_tty *pss, uint16_t columns, uint16_t rows) {
@@ -546,6 +978,9 @@ int callback_tty(struct lws *wsi, enum lws_callback_reasons reason, void *user, 
       pss->client_index = -1;
       pss->requested_columns = 0;
       pss->requested_rows = 0;
+      pss->pending_session_resize = false;
+      pss->pending_session_columns = 0;
+      pss->pending_session_rows = 0;
 
       if (server->url_arg) {
         while (lws_hdr_copy_fragment(wsi, buf, sizeof(buf), WSI_TOKEN_HTTP_URI_ARGS, n++) > 0) {
@@ -565,27 +1000,87 @@ int callback_tty(struct lws *wsi, enum lws_callback_reasons reason, void *user, 
 
     case LWS_CALLBACK_SERVER_WRITEABLE:
       if (!pss->initialized) {
-        if (pss->initial_cmd_index == sizeof(initial_cmds)) {
-          pss->initialized = true;
-          // Only resume in non-shared mode (pss->process is NULL in shared mode)
-          if (!server->shared_pty_mode && pss->process != NULL) {
-            pty_resume(pss->process);
+        // Send initial messages (window title, preferences)
+        if (pss->initial_cmd_index < sizeof(initial_cmds)) {
+          if (send_initial_message(wsi, pss->initial_cmd_index) < 0) {
+            lwsl_err("failed to send initial message, index: %d\n", pss->initial_cmd_index);
+            lws_close_reason(wsi, LWS_CLOSE_STATUS_UNEXPECTED_CONDITION, NULL, 0);
+            return -1;
           }
+          pss->initial_cmd_index++;
+          lws_callback_on_writable(wsi);
           break;
         }
-        if (send_initial_message(wsi, pss->initial_cmd_index) < 0) {
-          lwsl_err("failed to send initial message, index: %d\n", pss->initial_cmd_index);
-          lws_close_reason(wsi, LWS_CLOSE_STATUS_UNEXPECTED_CONDITION, NULL, 0);
-          return -1;
+
+        // After initial messages, send snapshot if in shared mode
+        if (server->shared_pty_mode && server->snapshot_enabled &&
+            server->tsm_screen != NULL && pss->client_index >= 0) {
+          uint16_t snapshot_cols = server->session_columns > 0 ? server->session_columns : pss->requested_columns;
+          uint16_t snapshot_rows = server->session_rows > 0 ? server->session_rows : pss->requested_rows;
+          // Generate snapshot sized to the shared session geometry
+          char *snapshot_json = serialize_snapshot(server, snapshot_cols, snapshot_rows);
+          if (snapshot_json != NULL) {
+            size_t json_len = strlen(snapshot_json);
+            unsigned char *message = xmalloc(LWS_PRE + 1 + json_len);
+            unsigned char *p = &message[LWS_PRE];
+
+            // Send snapshot message: SNAPSHOT + JSON
+            p[0] = SNAPSHOT;
+            memcpy(p + 1, snapshot_json, json_len);
+
+            int n = lws_write(wsi, p, 1 + json_len, LWS_WRITE_BINARY);
+            free(message);
+            free(snapshot_json);
+
+            if (n < 0) {
+              lwsl_err("failed to send snapshot\n");
+              return -1;
+            }
+
+            lwsl_notice("Sent snapshot to client %s (%d bytes)\n", pss->address, (int)json_len);
+          }
         }
-        pss->initial_cmd_index++;
-        lws_callback_on_writable(wsi);
+
+        // Now mark as initialized
+        pss->initialized = true;
+
+        // Only resume in non-shared mode (pss->process is NULL in shared mode)
+        if (!server->shared_pty_mode && pss->process != NULL) {
+          pty_resume(pss->process);
+        }
         break;
       }
 
       if (pss->lws_close_status > LWS_CLOSE_STATUS_NOSTATUS) {
         lws_close_reason(wsi, pss->lws_close_status, NULL, 0);
         return 1;
+      }
+
+      if (server->shared_pty_mode && pss->pending_session_resize) {
+        json_object *resize = json_object_new_object();
+        json_object_object_add(resize, "columns", json_object_new_int(pss->pending_session_columns));
+        json_object_object_add(resize, "rows", json_object_new_int(pss->pending_session_rows));
+
+        const char *json_str = json_object_to_json_string(resize);
+        size_t json_len = strlen(json_str);
+        unsigned char *message = xmalloc(LWS_PRE + 1 + json_len);
+        unsigned char *p = &message[LWS_PRE];
+        p[0] = SESSION_RESIZE;
+        memcpy(p + 1, json_str, json_len);
+
+        int written = lws_write(wsi, p, 1 + json_len, LWS_WRITE_BINARY);
+        if (written < 0) {
+          lwsl_err("failed to send session resize to client %s\n", pss->address);
+        } else {
+          lwsl_notice("Sent session resize %dx%d to client %s\n",
+                      pss->pending_session_columns,
+                      pss->pending_session_rows,
+                      pss->address);
+        }
+
+        free(message);
+        json_object_put(resize);
+        pss->pending_session_resize = false;
       }
 
       if (pss->pty_buf != NULL) {
@@ -664,34 +1159,19 @@ int callback_tty(struct lws *wsi, enum lws_callback_reasons reason, void *user, 
         case RESIZE_TERMINAL:
           if (!server->shared_pty_mode && pss->process == NULL) break;
 
-          // NEW: Shared mode - max-dimension strategy
-          if (server->shared_pty_mode && server->shared_process != NULL) {
+          if (server->shared_pty_mode) {
             uint16_t req_cols = 0, req_rows = 0;
             json_object_put(parse_window_size(pss->buffer + 1, pss->len - 1, &req_cols, &req_rows));
 
-            // Store this client's requested dimensions
             pss->requested_columns = req_cols;
             pss->requested_rows = req_rows;
 
-            // Calculate max dimensions across all clients
-            uint16_t max_cols = 0, max_rows = 0;
-            for (int i = 0; i < server->client_wsi_capacity; i++) {
-              if (server->client_wsi_list[i] != NULL) {
-                struct pss_tty *p = get_pss_from_wsi(server->client_wsi_list[i]);
-                if (p->requested_columns > max_cols) max_cols = p->requested_columns;
-                if (p->requested_rows > max_rows) max_rows = p->requested_rows;
-              }
-            }
+            update_shared_session_geometry(server);
 
-            // Apply maximum dimensions
-            if (max_cols > 0 && max_rows > 0) {
-              pty_resize_set(server->shared_process, max_cols, max_rows);
-              server->primary_columns = max_cols;
-              server->primary_rows = max_rows;
-              lwsl_notice("Resized shared PTY to max dimensions: %dx%d\n", max_cols, max_rows);
+            if (server->session_columns > 0 && server->session_rows > 0) {
+              queue_session_resize_for_client(pss, server->session_columns, server->session_rows);
             }
           } else {
-            // OLD: Per-client mode
             json_object_put(
                 parse_window_size(pss->buffer + 1, pss->len - 1, &pss->process->columns, &pss->process->rows));
             pty_resize(pss->process);
@@ -735,7 +1215,7 @@ int callback_tty(struct lws *wsi, enum lws_callback_reasons reason, void *user, 
 
           // NEW: Shared PTY mode
           if (server->shared_pty_mode) {
-            // Store requested dimensions for max-dimension strategy
+            // Store requested dimensions for narrowest-client policy
             pss->requested_columns = columns;
             pss->requested_rows = rows;
 
@@ -754,6 +1234,13 @@ int callback_tty(struct lws *wsi, enum lws_callback_reasons reason, void *user, 
 
             // Add this client to the tracking list
             add_client_to_list(server, wsi);
+
+            // Recompute shared session geometry now that the client list changed
+            update_shared_session_geometry(server);
+
+            if (server->session_columns > 0 && server->session_rows > 0) {
+              queue_session_resize_for_client(pss, server->session_columns, server->session_rows);
+            }
 
             // Trigger initial message sending (don't set initialized yet)
             lws_callback_on_writable(wsi);

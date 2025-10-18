@@ -1,0 +1,14 @@
+/* SPDX-License-Identifier: MIT */
+/* libtsm configuration header for ttyd integration */
+
+#ifndef LIBTSM_CONFIG_H
+#define LIBTSM_CONFIG_H
+
+/* Disable extra debug logging by default */
+#define BUILD_ENABLE_DEBUG 0
+
+/* Standard POSIX feature macros */
+#define _GNU_SOURCE
+#define _POSIX_C_SOURCE 200809L
+
+#endif /* LIBTSM_CONFIG_H */

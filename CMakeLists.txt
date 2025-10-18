@@ -29,6 +29,32 @@ endif()
 
 set(SOURCE_FILES src/utils.c src/pty.c src/protocol.c src/http.c src/server.c)
 
+# libtsm - Terminal State Machine for snapshot support
+set(LIBTSM_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/libtsm)
+set(LIBTSM_SOURCES
+    ${LIBTSM_DIR}/src/tsm/tsm-render.c
+    ${LIBTSM_DIR}/src/tsm/tsm-screen.c
+    ${LIBTSM_DIR}/src/tsm/tsm-selection.c
+    ${LIBTSM_DIR}/src/tsm/tsm-unicode.c
+    ${LIBTSM_DIR}/src/tsm/tsm-vte-charsets.c
+    ${LIBTSM_DIR}/src/tsm/tsm-vte.c
+    ${LIBTSM_DIR}/src/shared/shl-htable.c
+    ${LIBTSM_DIR}/external/wcwidth/wcwidth.c
+)
+set(LIBTSM_INCLUDE_DIRS
+    ${LIBTSM_DIR}/src/tsm
+    ${LIBTSM_DIR}/src/shared
+    ${LIBTSM_DIR}/external/wcwidth
+    ${LIBTSM_DIR}/external
+)
+
+# Generate config.h for libtsm
+configure_file(
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/libtsm-config.h.in
+    ${CMAKE_CURRENT_BINARY_DIR}/libtsm-config.h
+)
+list(APPEND LIBTSM_INCLUDE_DIRS ${CMAKE_CURRENT_BINARY_DIR})
+
 include(FindPackageHandleStandardArgs)
 
 find_path(LIBUV_INCLUDE_DIR NAMES uv.h)
@@ -52,7 +78,7 @@ endif()
 find_package(ZLIB REQUIRED)
 find_package(Libwebsockets 3.2.0 REQUIRED)
 
-set(INCLUDE_DIRS ${ZLIB_INCLUDE_DIR} ${LIBWEBSOCKETS_INCLUDE_DIRS} ${JSON-C_INCLUDE_DIRS} ${LIBUV_INCLUDE_DIRS})
+set(INCLUDE_DIRS ${ZLIB_INCLUDE_DIR} ${LIBWEBSOCKETS_INCLUDE_DIRS} ${JSON-C_INCLUDE_DIRS} ${LIBUV_INCLUDE_DIRS} ${LIBTSM_INCLUDE_DIRS})
 set(LINK_LIBS ${ZLIB_LIBRARIES} ${LIBWEBSOCKETS_LIBRARIES} ${JSON-C_LIBRARIES} ${LIBUV_LIBRARIES})
 
 set (CMAKE_REQUIRED_INCLUDES ${INCLUDE_DIRS})
@@ -80,7 +106,7 @@ else()
     endif()
 endif()
 
-add_executable(${PROJECT_NAME} ${SOURCE_FILES})
+add_executable(${PROJECT_NAME} ${SOURCE_FILES} ${LIBTSM_SOURCES})
 target_include_directories(${PROJECT_NAME} PUBLIC ${INCLUDE_DIRS})
 target_link_libraries(${PROJECT_NAME} ${LINK_LIBS})
 target_compile_definitions(${PROJECT_NAME} PUBLIC
@@ -92,3 +118,16 @@ include(GNUInstallDirs)
 
 install(TARGETS ${PROJECT_NAME} DESTINATION "${CMAKE_INSTALL_BINDIR}" COMPONENT prog)
 install(FILES man/ttyd.1 DESTINATION "${CMAKE_INSTALL_MANDIR}/man1" COMPONENT doc)
+
+enable_testing()
+
+add_executable(shared_pty_tests tests/shared_pty_regression_tests.c ${LIBTSM_SOURCES})
+target_include_directories(shared_pty_tests PRIVATE
+    tests/stubs
+    ${JSON-C_INCLUDE_DIRS}
+    ${LIBUV_INCLUDE_DIRS}
+    ${ZLIB_INCLUDE_DIR}
+    ${LIBTSM_INCLUDE_DIRS}
+)
+target_link_libraries(shared_pty_tests ${JSON-C_LIBRARIES} ${LIBUV_LIBRARIES})
+add_test(NAME shared_pty_regressions COMMAND shared_pty_tests)
