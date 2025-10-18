@@ -50,15 +50,23 @@ struct pss_tty {
   char *buffer;
   size_t len;
 
-  pty_process *process;
+  pty_process *process;        // Used when shared_pty_mode = false
   pty_buf_t *pty_buf;
 
   int lws_close_status;
+
+  // NEW: Client tracking for shared mode
+  bool is_primary_client;      // Is this the first/controlling client?
+  int client_index;            // Index in server->client_wsi_list (-1 if not in list)
+  uint16_t requested_columns;  // For max-dimension strategy
+  uint16_t requested_rows;
 };
 
 typedef struct {
-  struct pss_tty *pss;
+  struct pss_tty *pss;     // Used in non-shared mode
+  struct server *server;   // Used in shared mode (points to server for broadcast)
   bool ws_closed;
+  bool shared_mode;        // Indicates which pointer to use
 } pty_ctx_t;
 
 struct server {
@@ -83,4 +91,14 @@ struct server {
   char terminal_type[30];  // terminal type to report
 
   uv_loop_t *loop;         // the libuv event loop
+
+  // NEW: Shared PTY support
+  bool shared_pty_mode;           // Enable shared PTY mode
+  pty_process *shared_process;    // The one shared PTY process
+  struct lws **client_wsi_list;   // Dynamic array of active WebSocket connections
+  int client_wsi_capacity;        // Capacity of the array
+  int active_client_count;        // Number of active clients in shared mode
+  uint16_t primary_columns;       // Terminal size from primary client
+  uint16_t primary_rows;
+  char *first_client_user;        // Username of first authenticated client (for TTYD_USER)
 };

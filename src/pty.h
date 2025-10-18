@@ -19,6 +19,7 @@ bool conpty_init();
 typedef struct {
   char *base;
   size_t len;
+  int ref_count;  // Reference counting for shared buffers
 } pty_buf_t;
 
 struct pty_process_;
@@ -55,6 +56,8 @@ struct pty_process_ {
 
 pty_buf_t *pty_buf_init(char *base, size_t len);
 void pty_buf_free(pty_buf_t *buf);
+pty_buf_t *pty_buf_retain(pty_buf_t *buf);     // Increment reference count
+void pty_buf_release(pty_buf_t *buf);          // Decrement reference count, free if zero
 pty_process *process_init(void *ctx, uv_loop_t *loop, char *argv[], char *envp[]);
 bool process_running(pty_process *process);
 void process_free(pty_process *process);
@@ -63,6 +66,7 @@ void pty_pause(pty_process *process);
 void pty_resume(pty_process *process);
 int pty_write(pty_process *process, pty_buf_t *buf);
 bool pty_resize(pty_process *process);
+bool pty_resize_set(pty_process *process, uint16_t columns, uint16_t rows);  // NEW: explicit dimensions
 bool pty_kill(pty_process *process, int sig);
 
 #endif  // TTYD_PTY_H

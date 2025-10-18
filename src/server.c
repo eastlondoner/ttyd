@@ -79,12 +79,13 @@ static const struct option options[] = {{"port", required_argument, NULL, 'p'},
                                         {"max-clients", required_argument, NULL, 'm'},
                                         {"once", no_argument, NULL, 'o'},
                                         {"exit-no-conn", no_argument, NULL, 'q'},
+                                        {"shared-pty", no_argument, NULL, 'Q'},
                                         {"browser", no_argument, NULL, 'B'},
                                         {"debug", required_argument, NULL, 'd'},
                                         {"version", no_argument, NULL, 'v'},
                                         {"help", no_argument, NULL, 'h'},
                                         {NULL, 0, 0, 0}};
-static const char *opt_string = "p:i:U:c:H:u:g:s:w:I:b:P:f:6aSC:K:A:Wt:T:Om:oqBd:vh";
+static const char *opt_string = "p:i:U:c:H:u:g:s:w:I:b:P:f:6aSC:K:A:Wt:T:Om:oqQBd:vh";
 
 static void print_help() {
   // clang-format off
@@ -111,6 +112,7 @@ static void print_help() {
           "    -m, --max-clients       Maximum clients to support (default: 0, no limit)\n"
           "    -o, --once              Accept only one client and exit on disconnection\n"
           "    -q, --exit-no-conn      Exit on all clients disconnection\n"
+          "    -Q, --shared-pty        Enable shared PTY mode (all clients share one terminal)\n"
           "    -B, --browser           Open terminal with the default system browser\n"
           "    -I, --index             Custom index.html path\n"
           "    -b, --base-path         Expected base path for requests coming from a reverse proxy (eg: /mounted/here, max length: 128)\n"
@@ -221,6 +223,21 @@ static void server_free(struct server *ts) {
     if (!stat(ts->socket_path, &st)) {
       unlink(ts->socket_path);
     }
+  }
+
+  // NEW: Clean up shared PTY resources
+  if (ts->shared_process != NULL) {
+    pty_kill(ts->shared_process, SIGTERM);
+    process_free(ts->shared_process);
+    ts->shared_process = NULL;
+  }
+  if (ts->client_wsi_list != NULL) {
+    free(ts->client_wsi_list);
+    ts->client_wsi_list = NULL;
+  }
+  if (ts->first_client_user != NULL) {
+    free(ts->first_client_user);
+    ts->first_client_user = NULL;
   }
 
   uv_loop_close(ts->loop);
@@ -375,6 +392,9 @@ int main(int argc, char **argv) {
       case 'q':
         server->exit_no_conn = true;
         break;
+      case 'Q':
+        server->shared_pty_mode = true;
+        break;
       case 'B':
         browser = true;
         break;
@@ -522,7 +542,12 @@ int main(int argc, char **argv) {
         return -1;
     }
   }
+
+  // Set disableStdin based on writable flag (after command line parsing)
+  json_object_object_add(client_prefs, "disableStdin", json_object_new_boolean(!server->writable));
+
   server->prefs_json = strdup(json_object_to_json_string(client_prefs));
+  lwsl_notice("Client preferences: %s\n", server->prefs_json);
   json_object_put(client_prefs);
 
   if (server->command == NULL || strlen(server->command) == 0) {
