@@ -68,6 +68,7 @@ struct pss_tty {
   bool pending_session_resize;     // Whether a session-wide resize needs to be sent
   uint16_t pending_session_columns;
   uint16_t pending_session_rows;
+  bool resize_sent;                // Track if initial resize was sent during handshake
 };
 
 typedef struct {

@@ -1014,6 +1014,7 @@ int callback_tty(struct lws *wsi, enum lws_callback_reasons reason, void *user, 
       pss->pending_session_resize = false;
       pss->pending_session_columns = 0;
       pss->pending_session_rows = 0;
+      pss->resize_sent = false;
 
       if (server->url_arg) {
         while (lws_hdr_copy_fragment(wsi, buf, sizeof(buf), WSI_TOKEN_HTTP_URI_ARGS, n++) > 0) {
@@ -1045,7 +1046,19 @@ int callback_tty(struct lws *wsi, enum lws_callback_reasons reason, void *user, 
           break;
         }
 
-        // After initial messages, send snapshot if in shared mode
+        // Send SESSION_RESIZE before snapshot (NEW POSITION)
+        // This ensures the client's terminal is resized BEFORE we send snapshot data
+        if (server->shared_pty_mode && pss->pending_session_resize && !pss->resize_sent) {
+          lwsl_debug("Client %s: requested=%dx%d, session=%dx%d, sending resize before snapshot\n",
+                     pss->address, pss->requested_columns, pss->requested_rows,
+                     server->session_columns, server->session_rows);
+          flush_pending_session_resize(server, pss, wsi);
+          pss->resize_sent = true;  // Mark as sent to prevent duplicate
+          lws_callback_on_writable(wsi);
+          break;  // Exit this callback, snapshot will be sent next time
+        }
+
+        // After initial messages and resize, send snapshot if in shared mode
         if (server->shared_pty_mode && server->snapshot_enabled &&
             server->tsm_screen != NULL && pss->client_index >= 0) {
           uint16_t snapshot_cols = server->session_columns > 0 ? server->session_columns : pss->requested_columns;
@@ -1080,11 +1093,6 @@ int callback_tty(struct lws *wsi, enum lws_callback_reasons reason, void *user, 
         // Only resume in non-shared mode (pss->process is NULL in shared mode)
         if (!server->shared_pty_mode && pss->process != NULL) {
           pty_resume(pss->process);
-        }
-
-        // Send any pending session resize to the newly initialized client
-        if (server->shared_pty_mode && pss->pending_session_resize) {
-          flush_pending_session_resize(server, pss, wsi);
         }
 
         // Queue another writable callback if there's PTY data waiting
