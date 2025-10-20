@@ -47,6 +47,9 @@ static int buf_free_count = 0;
 static int pty_resize_set_call_count = 0;
 static uint16_t last_resize_set_cols = 0;
 static uint16_t last_resize_set_rows = 0;
+static unsigned char last_write_cmd = 0;
+static char last_write_payload[1024];
+static size_t last_write_payload_len = 0;
 
 static void reset_stub_state(void) {
   writable_call_count = 0;
@@ -61,6 +64,9 @@ static void reset_stub_state(void) {
   last_resize_set_cols = 0;
   last_resize_set_rows = 0;
   force_exit = false;
+  last_write_cmd = 0;
+  last_write_payload_len = 0;
+  last_write_payload[0] = '\0';
 }
 
 static void test_exit(int code) {
@@ -152,8 +158,23 @@ struct lws *lws_get_network_wsi(struct lws *wsi) { return wsi; }
 
 int lws_write(struct lws *wsi, unsigned char *buf, size_t len, enum lws_write_protocol protocol) {
   (void)wsi;
-  (void)buf;
   (void)protocol;
+  if (len > 0 && buf != NULL) {
+    last_write_cmd = buf[0];
+    size_t payload_len = len > 0 ? len - 1 : 0;
+    if (payload_len >= sizeof(last_write_payload)) {
+      payload_len = sizeof(last_write_payload) - 1;
+    }
+    if (payload_len > 0) {
+      memcpy(last_write_payload, (const char *)(buf + 1), payload_len);
+    }
+    last_write_payload[payload_len] = '\0';
+    last_write_payload_len = payload_len;
+  } else {
+    last_write_cmd = 0;
+    last_write_payload_len = 0;
+    last_write_payload[0] = '\0';
+  }
   return (int)len;
 }
 
@@ -305,6 +326,9 @@ static void init_server(int capacity) {
   server->shared_pty_mode = true;
   server->client_wsi_capacity = capacity;
   server->client_wsi_list = calloc((size_t)capacity, sizeof(struct lws *));
+  server->session_columns = 120;
+  server->session_rows = 32;
+  server->snapshot_enabled = true;
 }
 
 static struct lws *make_client(struct pss_tty *pss, int slot, bool initialized) {
@@ -349,6 +373,9 @@ static void free_shared_process(pty_process *process, bool ctx_already_freed) {
     free(process->ctx);
   }
   free(process);
+  if (server != NULL && server->shared_process == process) {
+    server->shared_process = NULL;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -415,13 +442,13 @@ static bool test_shared_read_resumes_after_broadcast(void) {
 
   int write_rc = callback_tty(pss_a.wsi, LWS_CALLBACK_SERVER_WRITEABLE, &pss_a, NULL, 0);
   ASSERT_INT_EQ(write_rc, 0, "primary client flush handled");
-  ASSERT_INT_EQ(pty_resume_call_count, 1, "pty resumed after primary client drain");
+  ASSERT_INT_EQ(pty_resume_call_count, 0, "pty remains paused until all clients drain");
   ASSERT_TRUE(pss_a.pty_buf == NULL, "primary client cleared buffer");
   ASSERT_INT_EQ(buf1->ref_count, 1, "buffer still retained by secondary client");
 
   write_rc = callback_tty(pss_b.wsi, LWS_CALLBACK_SERVER_WRITEABLE, &pss_b, NULL, 0);
   ASSERT_INT_EQ(write_rc, 0, "secondary client flush handled");
-  ASSERT_INT_EQ(pty_resume_call_count, 2, "pty resumed after secondary client drain");
+  ASSERT_INT_EQ(pty_resume_call_count, 1, "pty resumed after all clients drained");
   ASSERT_TRUE(pss_b.pty_buf == NULL, "secondary client cleared buffer");
   ASSERT_INT_EQ(buf_free_count, 1, "buffer released after both clients flush");
 
@@ -429,7 +456,7 @@ static bool test_shared_read_resumes_after_broadcast(void) {
   pty_buf_t *buf2 = pty_buf_init(payload2, strlen(payload2));
 
   shared_process_read_cb(process, buf2, false);
-  ASSERT_INT_EQ(pty_resume_call_count, 2, "pty paused until second flush");
+  ASSERT_INT_EQ(pty_resume_call_count, 1, "pty paused until second flush");
   ASSERT_INT_EQ(writable_call_count, 4, "both clients received second writable");
   ASSERT_PTR_EQ(pss_a.pty_buf, buf2, "primary received second buffer");
   ASSERT_PTR_EQ(pss_b.pty_buf, buf2, "secondary received second buffer");
@@ -437,13 +464,13 @@ static bool test_shared_read_resumes_after_broadcast(void) {
 
   write_rc = callback_tty(pss_a.wsi, LWS_CALLBACK_SERVER_WRITEABLE, &pss_a, NULL, 0);
   ASSERT_INT_EQ(write_rc, 0, "primary client flushed second buffer");
-  ASSERT_INT_EQ(pty_resume_call_count, 3, "pty resumed after primary drained second buffer");
+  ASSERT_INT_EQ(pty_resume_call_count, 1, "pty still paused until second client drains");
   ASSERT_TRUE(pss_a.pty_buf == NULL, "primary cleared second buffer");
   ASSERT_INT_EQ(buf2->ref_count, 1, "second buffer retained by secondary");
 
   write_rc = callback_tty(pss_b.wsi, LWS_CALLBACK_SERVER_WRITEABLE, &pss_b, NULL, 0);
   ASSERT_INT_EQ(write_rc, 0, "secondary client flushed second buffer");
-  ASSERT_INT_EQ(pty_resume_call_count, 4, "pty resumed after secondary drained second buffer");
+  ASSERT_INT_EQ(pty_resume_call_count, 2, "pty resumed after secondary drained second buffer");
   ASSERT_TRUE(pss_b.pty_buf == NULL, "secondary cleared second buffer");
   ASSERT_INT_EQ(buf_free_count, 2, "second buffer released after both clients flush");
 
@@ -490,6 +517,90 @@ static bool test_shared_buffer_released_on_close(void) {
   free_client(&pss_a);
   free_client(&pss_b);
   free_shared_process(process, false);
+  teardown_server();
+  return true;
+}
+
+static bool test_shared_resume_on_close_when_last_buffer_dropped(void) {
+  reset_stub_state();
+  init_server(1);
+  server->active_client_count = 0;
+  server->client_count = 1;
+
+  struct pss_tty pss;
+  make_client(&pss, 0, true);
+
+  pty_ctx_t *ctx = NULL;
+  pty_process *process = make_shared_process(server, &ctx);
+
+  char *payload = strdup("chunk");
+  pty_buf_t *buf = pty_buf_init(payload, strlen(payload));
+  pss.pty_buf = buf;
+
+  int result = callback_tty(pss.wsi, LWS_CALLBACK_CLOSED, &pss, NULL, 0);
+  ASSERT_INT_EQ(result, 0, "closed callback succeeds");
+  ASSERT_TRUE(pss.pty_buf == NULL, "pending buffer cleared on close");
+  ASSERT_INT_EQ(buf_free_count, 1, "buffer freed when final reference dropped");
+  ASSERT_INT_EQ(pty_resume_call_count, 1, "pty resumed after last buffer released on close");
+
+  free_client(&pss);
+  free_shared_process(process, false);
+  teardown_server();
+  return true;
+}
+
+static bool test_snapshot_preserves_whitespace(void) {
+  reset_stub_state();
+  init_server(1);
+  server->snapshot_enabled = true;
+  server->scrollback_size = 1000;
+
+  ASSERT_TRUE(init_tsm_screen(server, 80, 24), "tsm screen initialized");
+
+  static const char *box_lines[] = {
+      "╭────────────────────────────────────────────────────╮",
+      "│ ✨ Update available! 0.46.0 -> 0.47.0.             │",
+      "│                                                    │",
+      "│ See full release notes:                            │",
+      "│                                                    │",
+      "│ https://github.com/openai/codex/releases/latest    │",
+      "│                                                    │",
+      "│ Run npm install -g @openai/codex@latest to update. │",
+      "╰────────────────────────────────────────────────────╯",
+  };
+
+  for (size_t i = 0; i < sizeof(box_lines) / sizeof(box_lines[0]); i++) {
+    size_t len = strlen(box_lines[i]);
+    char *line = malloc(len + 3);
+    memcpy(line, box_lines[i], len);
+    line[len] = '\r';
+    line[len + 1] = '\n';
+    line[len + 2] = '\0';
+    tsm_vte_input(server->tsm_vte, line, len + 2);
+    free(line);
+  }
+
+  char *snapshot_json = serialize_snapshot(server, 80, 24);
+  ASSERT_TRUE(snapshot_json != NULL, "snapshot json generated");
+
+  struct json_object *snapshot = json_tokener_parse(snapshot_json);
+  ASSERT_TRUE(snapshot != NULL, "snapshot json parsed");
+
+  struct json_object *lines = NULL;
+  ASSERT_TRUE(json_object_object_get_ex(snapshot, "lines", &lines), "snapshot contains lines array");
+  ASSERT_TRUE(json_object_get_type(lines) == json_type_array, "lines is an array");
+
+  // Second line contains the headline text we care about
+  struct json_object *line = json_object_array_get_idx(lines, 1);
+  ASSERT_TRUE(line != NULL, "line extracted");
+  const char *rendered = json_object_get_string(line);
+  ASSERT_TRUE(rendered != NULL, "line string obtained");
+  ASSERT_TRUE(strstr(rendered, "Update available!") != NULL, "headline retains spacing");
+  ASSERT_TRUE(strstr(rendered, "See full release notes") == NULL, "line limited to headline content");
+
+  json_object_put(snapshot);
+  free(snapshot_json);
+  cleanup_tsm_screen(server);
   teardown_server();
   return true;
 }
@@ -583,107 +694,98 @@ static bool test_once_flag_triggers_teardown(void) {
   return true;
 }
 
-static bool test_narrowest_policy_updates_session_size(void) {
+static bool test_fixed_geometry_sent_on_handshake(void) {
   reset_stub_state();
-  init_server(3);
+  init_server(1);
+  server->session_columns = 132;
+  server->session_rows = 43;
+  server->snapshot_enabled = false;
 
-  struct pss_tty pss_a;
-  struct pss_tty pss_b;
-  struct pss_tty pss_c;
-  make_client(&pss_a, 0, true);
-  make_client(&pss_b, 1, true);
-  make_client(&pss_c, 2, true);
+  struct pss_tty pss;
+  struct lws *wsi = make_client(&pss, 0, false);
+  (void)wsi;
 
   pty_ctx_t *ctx = NULL;
   pty_process *process = make_shared_process(server, &ctx);
+  server->shared_process = process;
 
-  server->session_columns = 120;
-  server->session_rows = 40;
+  pss.initial_cmd_index = sizeof(initial_cmds);
+  pss.pending_session_resize = true;
+  pss.resize_sent = false;
+  pss.client_index = 0;
 
-  pss_a.requested_columns = 120;
-  pss_a.requested_rows = 40;
-  pss_b.requested_columns = 80;
-  pss_b.requested_rows = 30;
-  pss_c.requested_columns = 100;
-  pss_c.requested_rows = 35;
+  int rc = callback_tty(pss.wsi, LWS_CALLBACK_SERVER_WRITEABLE, &pss, NULL, 0);
+  ASSERT_INT_EQ(rc, 0, "handshake writable succeeded");
+  ASSERT_INT_EQ(last_write_cmd, SESSION_RESIZE, "session resize frame sent first");
 
-  pss_a.initialized = true;
-  pss_b.initialized = true;
-  pss_c.initialized = true;
+  struct json_object *obj = json_tokener_parse(last_write_payload);
+  ASSERT_TRUE(obj != NULL, "resize payload parsed");
+  struct json_object *cols = NULL;
+  struct json_object *rows = NULL;
+  ASSERT_TRUE(json_object_object_get_ex(obj, "columns", &cols), "columns present");
+  ASSERT_TRUE(json_object_object_get_ex(obj, "rows", &rows), "rows present");
+  ASSERT_INT_EQ(json_object_get_int(cols), server->session_columns, "columns enforced");
+  ASSERT_INT_EQ(json_object_get_int(rows), server->session_rows, "rows enforced");
+  json_object_put(obj);
 
-  update_shared_session_geometry(server);
+  ASSERT_TRUE(pss.resize_sent, "resize marked as sent");
+  ASSERT_TRUE(!pss.pending_session_resize, "pending resize cleared");
+  ASSERT_TRUE(!pss.initialized, "snapshot pending stage not yet marked initialized");
 
-  ASSERT_INT_EQ(pty_resize_set_call_count, 1, "pty_resize_set invoked once");
-  ASSERT_INT_EQ(last_resize_set_cols, 80, "minimum columns applied");
-  ASSERT_INT_EQ(last_resize_set_rows, 30, "minimum rows applied");
-  ASSERT_INT_EQ(server->session_columns, 80, "server session columns updated");
-  ASSERT_INT_EQ(server->session_rows, 30, "server session rows updated");
-
-  ASSERT_TRUE(pss_a.pending_session_resize, "client A pending session resize flag set");
-  ASSERT_TRUE(pss_b.pending_session_resize, "client B pending session resize flag set");
-  ASSERT_TRUE(pss_c.pending_session_resize, "client C pending session resize flag set");
-  ASSERT_INT_EQ(pss_a.pending_session_columns, 80, "client A pending columns propagate");
-  ASSERT_INT_EQ(pss_b.pending_session_columns, 80, "client B pending columns propagate");
-  ASSERT_INT_EQ(pss_c.pending_session_columns, 80, "client C pending columns propagate");
-  ASSERT_INT_EQ(pss_a.pending_session_rows, 30, "client A pending rows propagate");
-  ASSERT_INT_EQ(pss_b.pending_session_rows, 30, "client B pending rows propagate");
-  ASSERT_INT_EQ(pss_c.pending_session_rows, 30, "client C pending rows propagate");
-  ASSERT_INT_EQ(writable_call_count, 3, "all clients scheduled writable for session resize");
-
-  free_client(&pss_a);
-  free_client(&pss_b);
-  free_client(&pss_c);
   free_shared_process(process, false);
+  free_client(&pss);
   teardown_server();
   return true;
 }
 
-static bool test_wide_client_forced_back_to_session_geometry(void) {
+static bool test_client_resize_request_reasserts_geometry(void) {
   reset_stub_state();
-  init_server(2);
-  server->client_count = 2;
+  init_server(1);
+  server->session_columns = 100;
+  server->session_rows = 40;
 
-  struct pss_tty pss_a;
-  struct pss_tty pss_b;
-  make_client(&pss_a, 0, true);
-  make_client(&pss_b, 1, true);
+  struct pss_tty pss;
+  make_client(&pss, 0, true);
+  pss.client_index = 0;
+  pss.initialized = true;
+  pss.resize_sent = true;
+  pss.pending_session_resize = false;
 
   pty_ctx_t *ctx = NULL;
   pty_process *process = make_shared_process(server, &ctx);
+  server->shared_process = process;
 
-  server->session_columns = 90;
-  server->session_rows = 32;
-
-  pss_a.requested_columns = 90;
-  pss_a.requested_rows = 32;
-  pss_b.requested_columns = 90;
-  pss_b.requested_rows = 32;
-  pss_a.initialized = true;
-  pss_b.initialized = true;
-
-  const char *resize_json = "{\"columns\":120,\"rows\":40}";
+  const char *resize_json = "{\"columns\":200,\"rows\":55}";
   size_t payload_len = strlen(resize_json);
   char *payload = malloc(payload_len + 2);
   payload[0] = RESIZE_TERMINAL;
   memcpy(payload + 1, resize_json, payload_len);
 
-  int rc = callback_tty(pss_b.wsi, LWS_CALLBACK_RECEIVE, &pss_b, payload, payload_len + 1);
-  ASSERT_INT_EQ(rc, 0, "wide client resize processed successfully");
+  int rc = callback_tty(pss.wsi, LWS_CALLBACK_RECEIVE, &pss, payload, payload_len + 1);
+  ASSERT_INT_EQ(rc, 0, "resize message processed");
   free(payload);
 
-  ASSERT_INT_EQ(pty_resize_set_call_count, 0, "pty_resize_set not called when session unchanged");
-  ASSERT_TRUE(pss_b.pending_session_resize, "wide client queued session resize");
-  ASSERT_INT_EQ(pss_b.pending_session_columns, server->session_columns, "pending columns match session");
-  ASSERT_INT_EQ(pss_b.pending_session_rows, server->session_rows, "pending rows match session");
-  ASSERT_INT_EQ(writable_call_count, 1, "wide client scheduled writable for session resize");
+  ASSERT_TRUE(pss.pending_session_resize, "server queued session resize");
+  ASSERT_INT_EQ(server->session_columns, 100, "session width unchanged");
+  ASSERT_INT_EQ(server->session_rows, 40, "session height unchanged");
 
-  int write_rc = callback_tty(pss_b.wsi, LWS_CALLBACK_SERVER_WRITEABLE, &pss_b, NULL, 0);
-  ASSERT_INT_EQ(write_rc, 0, "server writeable callback succeeded");
-  ASSERT_TRUE(!pss_b.pending_session_resize, "pending session resize cleared after send");
+  rc = callback_tty(pss.wsi, LWS_CALLBACK_SERVER_WRITEABLE, &pss, NULL, 0);
+  ASSERT_INT_EQ(rc, 0, "writable after resize processed");
+  ASSERT_INT_EQ(last_write_cmd, SESSION_RESIZE, "session resize resent");
+  ASSERT_TRUE(!pss.pending_session_resize, "pending flag cleared");
 
-  free_client(&pss_a);
-  free_client(&pss_b);
+  struct json_object *obj = json_tokener_parse(last_write_payload);
+  ASSERT_TRUE(obj != NULL, "resize payload parsed");
+  struct json_object *cols = NULL;
+  struct json_object *rows = NULL;
+  ASSERT_TRUE(json_object_object_get_ex(obj, "columns", &cols), "columns present");
+  ASSERT_TRUE(json_object_object_get_ex(obj, "rows", &rows), "rows present");
+  ASSERT_INT_EQ(json_object_get_int(cols), server->session_columns, "columns enforced after resize");
+  ASSERT_INT_EQ(json_object_get_int(rows), server->session_rows, "rows enforced after resize");
+  json_object_put(obj);
+
   free_shared_process(process, false);
+  free_client(&pss);
   teardown_server();
   return true;
 }
@@ -699,10 +801,12 @@ int main(void) {
   } tests[] = {
       {"shared_read_resumes_after_broadcast", test_shared_read_resumes_after_broadcast},
       {"shared_buffer_released_on_close", test_shared_buffer_released_on_close},
+      {"shared_resume_on_close_when_last_buffer_dropped", test_shared_resume_on_close_when_last_buffer_dropped},
+      {"snapshot_preserves_whitespace", test_snapshot_preserves_whitespace},
       {"remove_client_without_initialization", test_remove_client_without_initialization},
       {"active_client_count_reset_on_process_exit", test_active_client_count_reset_on_process_exit},
-      {"narrowest_policy_updates_session_size", test_narrowest_policy_updates_session_size},
-      {"wide_client_forced_back_to_session_geometry", test_wide_client_forced_back_to_session_geometry},
+      {"fixed_geometry_sent_on_handshake", test_fixed_geometry_sent_on_handshake},
+      {"client_resize_request_reasserts_geometry", test_client_resize_request_reasserts_geometry},
       {"once_flag_triggers_teardown", test_once_flag_triggers_teardown},
   };
 

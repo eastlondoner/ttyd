@@ -4,7 +4,6 @@ import { Terminal } from '@xterm/xterm';
 import { CanvasAddon } from '@xterm/addon-canvas';
 import { ClipboardAddon } from '@xterm/addon-clipboard';
 import { WebglAddon } from '@xterm/addon-webgl';
-import { FitAddon } from '@xterm/addon-fit';
 import { WebLinksAddon } from '@xterm/addon-web-links';
 import { ImageAddon } from '@xterm/addon-image';
 import { Unicode11Addon } from '@xterm/addon-unicode11';
@@ -13,13 +12,9 @@ import { ZmodemAddon } from './addons/zmodem';
 
 import '@xterm/xterm/css/xterm.css';
 
-interface TtydTerminal extends Terminal {
-    fit(): void;
-}
-
 declare global {
     interface Window {
-        term: TtydTerminal;
+        term: Terminal;
     }
 }
 
@@ -36,6 +31,7 @@ enum Command {
     RESIZE_TERMINAL = '1',
     PAUSE = '2',
     RESUME = '3',
+    SNAPSHOT_ACK = '4',
 }
 type Preferences = ITerminalOptions & ClientOptions;
 
@@ -86,7 +82,6 @@ export class Xterm {
     private pending = 0;
 
     private terminal: Terminal;
-    private fitAddon = new FitAddon();
     private overlayAddon = new OverlayAddon();
     private clipboardAddon = new ClipboardAddon();
     private webLinksAddon = new WebLinksAddon();
@@ -159,24 +154,20 @@ export class Xterm {
     @bind
     public open(parent: HTMLElement) {
         this.terminal = new Terminal(this.options.termOptions);
-        const { terminal, fitAddon, overlayAddon, clipboardAddon, webLinksAddon } = this;
-        window.term = terminal as TtydTerminal;
-        window.term.fit = () => {
-            this.fitAddon.fit();
-        };
+        const { terminal, overlayAddon, clipboardAddon, webLinksAddon } = this;
+        window.term = terminal;
 
-        terminal.loadAddon(fitAddon);
         terminal.loadAddon(overlayAddon);
         terminal.loadAddon(clipboardAddon);
         terminal.loadAddon(webLinksAddon);
 
         terminal.open(parent);
-        fitAddon.fit();
+        parent.style.overflow = 'auto';
     }
 
     @bind
     private initListeners() {
-        const { terminal, fitAddon, overlayAddon, register, sendData } = this;
+        const { terminal, register, sendData } = this;
         register(
             terminal.onTitleChange(data => {
                 if (data && data !== '' && !this.titleFixed) {
@@ -193,15 +184,10 @@ export class Xterm {
                 }
 
                 if (this.sessionCols !== undefined && this.sessionRows !== undefined) {
-                    if (cols > this.sessionCols || rows > this.sessionRows) {
+                    if (cols !== this.sessionCols || rows !== this.sessionRows) {
                         this.forceSessionGeometry(this.sessionCols, this.sessionRows);
-                        return;
                     }
                 }
-
-                const msg = JSON.stringify({ columns: cols, rows: rows });
-                this.socket?.send(this.textEncoder.encode(Command.RESIZE_TERMINAL + msg));
-                if (this.resizeOverlay) overlayAddon.showOverlay(`${cols}x${rows}`, 300);
             })
         );
         register(
@@ -215,7 +201,6 @@ export class Xterm {
                 this.overlayAddon?.showOverlay('\u2702', 200);
             })
         );
-        register(addEventListener(window, 'resize', () => fitAddon.fit()));
         register(addEventListener(window, 'beforeunload', this.onWindowUnload));
     }
 
@@ -391,7 +376,7 @@ export class Xterm {
 
     @bind
     private applyPreferences(prefs: Preferences) {
-        const { terminal, fitAddon, register } = this;
+        const { terminal, register } = this;
         if (prefs.enableZmodem || prefs.enableTrzsz) {
             this.zmodemAddon = new ZmodemAddon({
                 zmodem: prefs.enableZmodem,
@@ -484,7 +469,11 @@ export class Xterm {
                     } else {
                         terminal.options[key] = value;
                     }
-                    if (key.indexOf('font') === 0) fitAddon.fit();
+                    if (key.indexOf('font') === 0) {
+                        const targetCols = this.sessionCols ?? terminal.cols;
+                        const targetRows = this.sessionRows ?? terminal.rows;
+                        this.forceSessionGeometry(targetCols, targetRows);
+                    }
                     break;
             }
         }
@@ -551,7 +540,7 @@ export class Xterm {
 
     @bind
     private applySnapshot(jsonData: string) {
-        const { terminal } = this;
+        const { terminal, socket, textEncoder } = this;
 
         try {
             const snapshot = JSON.parse(jsonData);
@@ -579,6 +568,12 @@ export class Xterm {
             terminal.write(`\x1b[${row};${col}H`);
 
             console.log('[ttyd] snapshot applied successfully');
+
+            // Send acknowledgment to server to unblock PTY output
+            if (socket?.readyState === WebSocket.OPEN) {
+                socket.send(textEncoder.encode(Command.SNAPSHOT_ACK));
+                console.log('[ttyd] sent snapshot acknowledgment');
+            }
         } catch (e) {
             console.error('[ttyd] failed to apply snapshot:', e);
         }

@@ -34,21 +34,29 @@ brew list | grep -E "(json-c|libwebsockets|libuv)"
 
 ## Building ttyd
 
-### Step 1: Clone the Repository (if not already done)
+ttyd consists of two main components:
+1. **Backend** - C-based server (compiled with CMake)
+2. **Frontend** - TypeScript/JavaScript web interface (compiled with Yarn + Webpack)
+
+For normal builds, you only need to build the backend. The frontend assets are already embedded in `src/html.h`. You only need to build the frontend if you're modifying the web interface code.
+
+### Building the Backend (Required)
+
+#### Step 1: Clone the Repository (if not already done)
 
 ```bash
 git clone https://github.com/tsl0922/ttyd.git
 cd ttyd
 ```
 
-### Step 2: Create Build Directory
+#### Step 2: Create Build Directory
 
 ```bash
 mkdir -p build
 cd build
 ```
 
-### Step 3: Run CMake Configuration
+#### Step 3: Run CMake Configuration
 
 ```bash
 cmake ..
@@ -63,7 +71,7 @@ Expected output should include:
 - Configuring done
 - Generating done
 
-### Step 4: Compile the Project
+#### Step 4: Compile the Project
 
 ```bash
 make
@@ -80,7 +88,7 @@ You should see compilation progress:
 [100%] Built target ttyd
 ```
 
-### Step 5: Install (Optional)
+#### Step 5: Install (Optional)
 
 To install ttyd system-wide:
 
@@ -91,6 +99,191 @@ sudo make install
 This will install:
 - Binary to `/usr/local/bin/ttyd`
 - Man page to `/usr/local/share/man/man1/ttyd.1`
+
+### Building the Frontend (Optional - Only for Development)
+
+The frontend is a TypeScript/Preact-based web application. You only need to build it if you're modifying the web interface.
+
+#### Frontend Prerequisites
+
+1. **Node.js** (version 16 or later recommended)
+   ```bash
+   # Check if Node.js is installed
+   node --version
+
+   # Install via Homebrew if needed
+   brew install node
+   ```
+
+2. **Corepack** (for Yarn 3.x)
+   ```bash
+   # Enable corepack (included with Node.js 16.9+)
+   corepack enable
+   ```
+
+#### Frontend Build Steps
+
+**Step 1: Navigate to the html directory**
+
+```bash
+cd html
+```
+
+**Step 2: Install dependencies**
+
+```bash
+yarn install
+```
+
+This will:
+- Download all npm dependencies
+- Set up the build environment
+- Install webpack, TypeScript, and other tools
+
+Expected output:
+```
+➤ YN0000: ┌ Resolution step
+➤ YN0000: └ Completed
+➤ YN0000: ┌ Fetch step
+➤ YN0000: └ Completed
+➤ YN0000: ┌ Link step
+➤ YN0000: └ Completed
+```
+
+**Step 3: Build the frontend**
+
+For production build (generates `src/html.h` for embedding in backend):
+
+```bash
+yarn build
+```
+
+Or use the inline build (recommended - generates embedded assets):
+
+```bash
+yarn inline
+```
+
+Build output:
+```
+webpack 5.90.3 compiled successfully
+[23:55:35] Using gulpfile ~/repos/ttyd/html/gulpfile.js
+[23:55:35] Starting 'default'...
+[23:55:35] Starting 'inline'...
+[23:55:35] Finished 'inline' after 16 ms
+[23:55:35] Finished 'default' after 73 ms
+```
+
+This creates:
+- `dist/app.*.js` - Compiled JavaScript bundle (~716 KB)
+- `dist/app.*.css` - Compiled CSS styles (~4 KB)
+- `dist/index.html` - Web interface HTML
+- `dist/inline.html` - Inlined version with embedded assets (~721 KB)
+- `src/html.h` - C header file with embedded frontend (~1.1 MB)
+
+**Step 4: Rebuild the backend with new frontend**
+
+After building the frontend, you need to recompile the backend to include the new `html.h`:
+
+```bash
+cd ../build
+make
+```
+
+#### Frontend Development Workflow
+
+For active development with hot-reload:
+
+```bash
+cd html
+yarn start
+```
+
+This starts a development server at `http://localhost:8080` with:
+- Automatic recompilation on file changes
+- Hot module replacement (HMR)
+- Source maps for debugging
+
+Then run ttyd backend separately:
+```bash
+cd ../build
+./ttyd -p 7681 bash
+```
+
+Visit `http://localhost:8080` to see the frontend, which will connect to the backend on port 7681.
+
+#### Frontend Build Commands Summary
+
+| Command | Purpose |
+|---------|---------|
+| `yarn install` | Install dependencies (first time or after package.json changes) |
+| `yarn build` | Production build (creates dist/ files) |
+| `yarn inline` | Production build + generate src/html.h for backend embedding |
+| `yarn start` | Development server with hot-reload (port 8080) |
+| `yarn check` | Run linter (ESLint) to check code quality |
+| `yarn fix` | Auto-fix linting issues (Prettier + ESLint) |
+
+#### Troubleshooting Frontend Builds
+
+**Yarn version mismatch:**
+
+If you see:
+```
+Error: This project's package.json defines "packageManager": "yarn@3.6.3"
+```
+
+Solution:
+```bash
+corepack enable
+```
+
+**Missing dependencies:**
+
+If build fails with module not found errors:
+```bash
+cd html
+rm -rf node_modules .yarn/cache
+yarn install
+```
+
+**TypeScript errors:**
+
+Run type checking:
+```bash
+yarn check
+```
+
+Fix automatically where possible:
+```bash
+yarn fix
+```
+
+**Outdated browser list:**
+
+If you see browserslist warnings, update it:
+```bash
+npx update-browserslist-db@latest
+```
+
+### Complete Build Process (Backend + Frontend)
+
+If you've modified both frontend and backend code:
+
+```bash
+# 1. Build frontend
+cd html
+yarn install      # Only needed once or after package.json changes
+yarn inline       # Generates src/html.h
+
+# 2. Build backend
+cd ../build
+cmake ..          # Only needed if CMakeLists.txt changed
+make              # Compiles C code + embeds html.h
+
+# 3. Test
+./ttyd --version
+./ttyd -p 7682 bash
+```
 
 ## Testing the Build
 

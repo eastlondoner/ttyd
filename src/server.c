@@ -4,12 +4,13 @@
 #include <getopt.h>
 #include <json.h>
 #include <libwebsockets.h>
-#include <signal.h>
 #include <stdbool.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <stdint.h>
 
 #include "utils.h"
 
@@ -80,12 +81,14 @@ static const struct option options[] = {{"port", required_argument, NULL, 'p'},
                                         {"once", no_argument, NULL, 'o'},
                                         {"exit-no-conn", no_argument, NULL, 'q'},
                                         {"shared-pty", no_argument, NULL, 'Q'},
+                                        {"session-width", required_argument, NULL, 'X'},
+                                        {"session-height", required_argument, NULL, 'Y'},
                                         {"browser", no_argument, NULL, 'B'},
                                         {"debug", required_argument, NULL, 'd'},
                                         {"version", no_argument, NULL, 'v'},
                                         {"help", no_argument, NULL, 'h'},
                                         {NULL, 0, 0, 0}};
-static const char *opt_string = "p:i:U:c:H:u:g:s:w:I:b:P:f:6aSC:K:A:Wt:T:Om:oqQBd:vh";
+static const char *opt_string = "p:i:U:c:H:u:g:s:w:I:b:P:f:6aSC:K:A:Wt:T:Om:oqQX:Y:Bd:vh";
 
 static void print_help() {
   // clang-format off
@@ -113,6 +116,8 @@ static void print_help() {
           "    -o, --once              Accept only one client and exit on disconnection\n"
           "    -q, --exit-no-conn      Exit on all clients disconnection\n"
           "    -Q, --shared-pty        Enable shared PTY mode (all clients share one terminal)\n"
+          "    -X, --session-width     Fixed terminal width in columns (default: 120)\n"
+          "    -Y, --session-height    Fixed terminal height in rows (default: 32)\n"
           "    -B, --browser           Open terminal with the default system browser\n"
           "    -I, --index             Custom index.html path\n"
           "    -b, --base-path         Expected base path for requests coming from a reverse proxy (eg: /mounted/here, max length: 128)\n"
@@ -157,6 +162,7 @@ static void print_config() {
   if (server->max_clients > 0) lwsl_notice("  max clients: %d\n", server->max_clients);
   if (server->once) lwsl_notice("  once: true\n");
   if (server->exit_no_conn) lwsl_notice("  exit_no_conn: true\n");
+  lwsl_notice("  session geometry: %ux%u (locked)\n", server->session_columns, server->session_rows);
   if (server->index != NULL) lwsl_notice("  custom index.html: %s\n", server->index);
   if (server->cwd != NULL) lwsl_notice("  working directory: %s\n", server->cwd);
   if (!server->writable) lwsl_warn("The --writable option is not set, will start in readonly mode\n");
@@ -179,6 +185,8 @@ static struct server *server_new(int argc, char **argv, int start) {
   ts->snapshot_enabled = true;  // Enable snapshots by default in shared mode
   ts->tsm_screen = NULL;
   ts->tsm_vte = NULL;
+  ts->session_columns = 120;
+  ts->session_rows = 32;
 
   if (start == argc) return ts;
 
@@ -412,6 +420,22 @@ int main(int argc, char **argv) {
       case 'Q':
         server->shared_pty_mode = true;
         break;
+      case 'X': {
+        int cols = parse_int("session-width", optarg);
+        if (cols <= 0 || cols > UINT16_MAX) {
+          fprintf(stderr, "ttyd: invalid session width: %s\n", optarg);
+          return -1;
+        }
+        server->session_columns = (uint16_t)cols;
+      } break;
+      case 'Y': {
+        int rows = parse_int("session-height", optarg);
+        if (rows <= 0 || rows > UINT16_MAX) {
+          fprintf(stderr, "ttyd: invalid session height: %s\n", optarg);
+          return -1;
+        }
+        server->session_rows = (uint16_t)rows;
+      } break;
       case 'B':
         browser = true;
         break;

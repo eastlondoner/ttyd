@@ -78,9 +78,7 @@ static inline struct pss_tty *get_pss_from_wsi(struct lws *wsi) {
   return (struct pss_tty *)lws_wsi_user(wsi);
 }
 
-static void queue_session_resize_for_client(struct pss_tty *pss, uint16_t cols, uint16_t rows);
-static void broadcast_session_resize(struct server *server, uint16_t cols, uint16_t rows);
-static void update_shared_session_geometry(struct server *server);
+static bool send_session_resize(struct server *server, struct pss_tty *pss, struct lws *wsi);
 
 static void add_client_to_list(struct server *server, struct lws *wsi) {
   // Resize array if needed (start at 8, double when full)
@@ -153,13 +151,11 @@ static void remove_client_from_list(struct server *server, struct lws *wsi) {
 
   pss->client_index = -1;
   pss->is_primary_client = false;
-  pss->requested_columns = 0;
-  pss->requested_rows = 0;
   pss->pending_session_resize = false;
+  pss->resize_sent = false;
+  pss->snapshot_pending = false;
 
   if (server->active_client_count == 0) {
-    server->session_columns = 0;
-    server->session_rows = 0;
     if (server->shared_process != NULL && (server->exit_no_conn || server->once)) {
       lwsl_notice("No clients remaining, killing shared process\n");
       pty_kill(server->shared_process, server->sig_code);
@@ -172,34 +168,21 @@ static void remove_client_from_list(struct server *server, struct lws *wsi) {
       lws_cancel_service(context);
       exit(0);
     }
-  } else {
-    update_shared_session_geometry(server);
   }
 }
 
-static void queue_session_resize_for_client(struct pss_tty *pss, uint16_t cols, uint16_t rows) {
-  if (pss == NULL || pss->wsi == NULL) return;
-  if (cols == 0 || rows == 0) return;
+static bool send_session_resize(struct server *server, struct pss_tty *pss, struct lws *wsi) {
+  if (server == NULL || pss == NULL || wsi == NULL) return false;
+  if (!server->shared_pty_mode) return false;
 
-  if (pss->pending_session_resize &&
-      pss->pending_session_columns == cols &&
-      pss->pending_session_rows == rows) {
-    return;
+  if (server->session_columns == 0 || server->session_rows == 0) {
+    lwsl_err("Session geometry is unset; cannot send resize to client %s\n", pss->address);
+    return false;
   }
-
-  pss->pending_session_resize = true;
-  pss->pending_session_columns = cols;
-  pss->pending_session_rows = rows;
-  lws_callback_on_writable(pss->wsi);
-}
-
-static void flush_pending_session_resize(struct server *server, struct pss_tty *pss, struct lws *wsi) {
-  if (server == NULL || pss == NULL || wsi == NULL) return;
-  if (!server->shared_pty_mode || !pss->pending_session_resize) return;
 
   json_object *resize = json_object_new_object();
-  json_object_object_add(resize, "columns", json_object_new_int(pss->pending_session_columns));
-  json_object_object_add(resize, "rows", json_object_new_int(pss->pending_session_rows));
+  json_object_object_add(resize, "columns", json_object_new_int(server->session_columns));
+  json_object_object_add(resize, "rows", json_object_new_int(server->session_rows));
 
   const char *json_str = json_object_to_json_string(resize);
   size_t json_len = strlen(json_str);
@@ -209,103 +192,33 @@ static void flush_pending_session_resize(struct server *server, struct pss_tty *
   memcpy(p + 1, json_str, json_len);
 
   int written = lws_write(wsi, p, 1 + json_len, LWS_WRITE_BINARY);
-  if (written < 0) {
+  bool success = written >= 0;
+  if (!success) {
     lwsl_err("failed to send session resize to client %s\n", pss->address);
   } else {
-    lwsl_notice("Sent session resize %dx%d to client %s\n",
-                pss->pending_session_columns,
-                pss->pending_session_rows,
+    lwsl_notice("Sent session resize %ux%u to client %s\n",
+                server->session_columns,
+                server->session_rows,
                 pss->address);
   }
 
   free(message);
   json_object_put(resize);
-  pss->pending_session_resize = false;
+  return success;
 }
 
-static void broadcast_session_resize(struct server *server, uint16_t cols, uint16_t rows) {
-  if (server->client_wsi_list == NULL) return;
-
-  for (int i = 0; i < server->client_wsi_capacity; i++) {
-    if (server->client_wsi_list[i] != NULL) {
-      struct pss_tty *pss = get_pss_from_wsi(server->client_wsi_list[i]);
-      queue_session_resize_for_client(pss, cols, rows);
-    }
-  }
-}
-
-static void update_shared_session_geometry(struct server *server) {
-  if (server == NULL || !server->shared_pty_mode) return;
-  if (server->active_client_count <= 0) return;
-
-  uint16_t min_cols = UINT16_MAX;
-  uint16_t min_rows = UINT16_MAX;
-  bool have_cols = false;
-  bool have_rows = false;
+static bool shared_session_has_pending_buffers(struct server *server) {
+  if (server == NULL || server->client_wsi_list == NULL) return false;
 
   for (int i = 0; i < server->client_wsi_capacity; i++) {
     if (server->client_wsi_list[i] == NULL) continue;
     struct pss_tty *pss = get_pss_from_wsi(server->client_wsi_list[i]);
-    if (pss == NULL) continue;
-
-    if (pss->requested_columns > 0) {
-      if (!have_cols || pss->requested_columns < min_cols) {
-        min_cols = pss->requested_columns;
-      }
-      have_cols = true;
-    }
-
-    if (pss->requested_rows > 0) {
-      if (!have_rows || pss->requested_rows < min_rows) {
-        min_rows = pss->requested_rows;
-      }
-      have_rows = true;
+    if (pss != NULL && pss->initialized && pss->pty_buf != NULL) {
+      return true;
     }
   }
 
-  if (!have_cols || !have_rows) {
-    lwsl_debug("Shared session geometry pending: cols_present=%d rows_present=%d\n",
-               (int)have_cols, (int)have_rows);
-    return;
-  }
-
-  bool changed = (min_cols != server->session_columns) || (min_rows != server->session_rows);
-  if (!changed) {
-    return;
-  }
-
-  lwsl_notice("Updating shared session geometry to %dx%d (narrowest clients)\n", min_cols, min_rows);
-
-  server->session_columns = min_cols;
-  server->session_rows = min_rows;
-
-  if (server->shared_process != NULL) {
-    bool resized = pty_resize_set(server->shared_process, min_cols, min_rows);
-    if (!resized) {
-      lwsl_err("Failed to resize shared PTY to %dx%d\n", min_cols, min_rows);
-    } else {
-      server->shared_process->columns = min_cols;
-      server->shared_process->rows = min_rows;
-    }
-  }
-
-  if (server->tsm_screen != NULL) {
-    int ret = tsm_screen_resize(server->tsm_screen, min_cols, min_rows);
-    if (ret < 0) {
-      lwsl_err("Failed to resize tsm_screen to %dx%d: %d\n", min_cols, min_rows, ret);
-    } else {
-      unsigned int cursor_x = tsm_screen_get_cursor_x(server->tsm_screen);
-      unsigned int cursor_y = tsm_screen_get_cursor_y(server->tsm_screen);
-      unsigned int new_x = cursor_x < min_cols ? cursor_x : (min_cols > 0 ? min_cols - 1 : 0);
-      unsigned int new_y = cursor_y < min_rows ? cursor_y : (min_rows > 0 ? min_rows - 1 : 0);
-      if (cursor_x != new_x || cursor_y != new_y) {
-        tsm_screen_move_to(server->tsm_screen, new_x, new_y);
-      }
-      lwsl_debug("Resized tsm_screen to %dx%d\n", min_cols, min_rows);
-    }
-  }
-
-  broadcast_session_resize(server, min_cols, min_rows);
+  return false;
 }
 
 static pty_ctx_t *pty_ctx_init(struct pss_tty *pss) {
@@ -365,11 +278,17 @@ static void cleanup_tsm_screen(struct server *server);
 static char *serialize_snapshot(struct server *server, uint16_t cols, uint16_t rows);
 
 // Create shared PTY process (called for first client only)
-static bool create_shared_process(struct server *server, struct pss_tty *first_pss,
-                                   uint16_t columns, uint16_t rows) {
+static bool create_shared_process(struct server *server, struct pss_tty *first_pss) {
   if (server->shared_process != NULL) {
     lwsl_warn("Shared process already exists\n");
     return true;  // Already exists
+  }
+
+  uint16_t columns = server->session_columns;
+  uint16_t rows = server->session_rows;
+  if (columns == 0 || rows == 0) {
+    lwsl_err("Session geometry must be non-zero (got %ux%u)\n", columns, rows);
+    return false;
   }
 
   // Save first client's username for TTYD_USER
@@ -412,8 +331,6 @@ static bool create_shared_process(struct server *server, struct pss_tty *first_p
   }
 
   server->shared_process = process;
-  server->session_columns = columns;
-  server->session_rows = rows;
 
   // Initialize libtsm screen for snapshots (if enabled)
   if (!init_tsm_screen(server, columns, rows)) {
@@ -531,8 +448,6 @@ static void shared_process_exit_cb(pty_process *process) {
 
   // Clean up shared process
   server->shared_process = NULL;  // Clear before freeing to prevent race
-  server->session_columns = 0;
-  server->session_rows = 0;
   server->active_client_count = 0;
 
   // Exit server if -o (once) flag is set
@@ -816,6 +731,16 @@ static int snapshot_draw_cb(struct tsm_screen *con, uint64_t id,
   append_sgr(line, &line_len, attr, &ctx->last_attr[posy]);
   ctx->last_attr[posy] = *attr;
 
+  if (len == 0) {
+    // Blank cells still need explicit spaces so layout is preserved
+    for (unsigned int i = 0; i < width && ctx->line_pos[posy] < ctx->width; i++) {
+      line[line_len++] = ' ';
+      ctx->line_pos[posy]++;
+    }
+    line[line_len] = '\0';
+    return 0;
+  }
+
   // Write the character(s) at this position
   for (size_t i = 0; i < len && ctx->line_pos[posy] < ctx->width; i++) {
     uint32_t codepoint = ch[i];
@@ -1009,12 +934,9 @@ int callback_tty(struct lws *wsi, enum lws_callback_reasons reason, void *user, 
       // NEW: Initialize shared mode fields
       pss->is_primary_client = false;
       pss->client_index = -1;
-      pss->requested_columns = 0;
-      pss->requested_rows = 0;
       pss->pending_session_resize = false;
-      pss->pending_session_columns = 0;
-      pss->pending_session_rows = 0;
       pss->resize_sent = false;
+      pss->snapshot_pending = false;
 
       if (server->url_arg) {
         while (lws_hdr_copy_fragment(wsi, buf, sizeof(buf), WSI_TOKEN_HTTP_URI_ARGS, n++) > 0) {
@@ -1046,23 +968,20 @@ int callback_tty(struct lws *wsi, enum lws_callback_reasons reason, void *user, 
           break;
         }
 
-        // Send SESSION_RESIZE before snapshot (NEW POSITION)
-        // This ensures the client's terminal is resized BEFORE we send snapshot data
-        if (server->shared_pty_mode && pss->pending_session_resize && !pss->resize_sent) {
-          lwsl_debug("Client %s: requested=%dx%d, session=%dx%d, sending resize before snapshot\n",
-                     pss->address, pss->requested_columns, pss->requested_rows,
-                     server->session_columns, server->session_rows);
-          flush_pending_session_resize(server, pss, wsi);
-          pss->resize_sent = true;  // Mark as sent to prevent duplicate
+        // Send SESSION_RESIZE before snapshot so the client adopts the session geometry
+        if (server->shared_pty_mode && !pss->resize_sent) {
+          bool sent = send_session_resize(server, pss, wsi);
+          pss->resize_sent = sent || pss->resize_sent;
+          pss->pending_session_resize = false;
           lws_callback_on_writable(wsi);
           break;  // Exit this callback, snapshot will be sent next time
         }
 
         // After initial messages and resize, send snapshot if in shared mode
         if (server->shared_pty_mode && server->snapshot_enabled &&
-            server->tsm_screen != NULL && pss->client_index >= 0) {
-          uint16_t snapshot_cols = server->session_columns > 0 ? server->session_columns : pss->requested_columns;
-          uint16_t snapshot_rows = server->session_rows > 0 ? server->session_rows : pss->requested_rows;
+            server->tsm_screen != NULL && pss->client_index >= 0 && !pss->snapshot_pending) {
+          uint16_t snapshot_cols = server->session_columns;
+          uint16_t snapshot_rows = server->session_rows;
           // Generate snapshot sized to the shared session geometry
           char *snapshot_json = serialize_snapshot(server, snapshot_cols, snapshot_rows);
           if (snapshot_json != NULL) {
@@ -1083,7 +1002,9 @@ int callback_tty(struct lws *wsi, enum lws_callback_reasons reason, void *user, 
               return -1;
             }
 
-            lwsl_notice("Sent snapshot to client %s (%d bytes)\n", pss->address, (int)json_len);
+            // Mark snapshot as pending - block PTY output until acknowledged
+            pss->snapshot_pending = true;
+            lwsl_notice("Sent snapshot to client %s (%d bytes), blocking PTY output\n", pss->address, (int)json_len);
           }
         }
 
@@ -1109,7 +1030,8 @@ int callback_tty(struct lws *wsi, enum lws_callback_reasons reason, void *user, 
 
       // Handle any pending session resize for already-initialized clients
       if (server->shared_pty_mode && pss->pending_session_resize) {
-        flush_pending_session_resize(server, pss, wsi);
+        send_session_resize(server, pss, wsi);
+        pss->pending_session_resize = false;
         // Queue another writable callback if there's PTY data waiting
         if (pss->pty_buf != NULL) {
           lws_callback_on_writable(wsi);
@@ -1118,6 +1040,13 @@ int callback_tty(struct lws *wsi, enum lws_callback_reasons reason, void *user, 
       }
 
       if (pss->pty_buf != NULL) {
+        // Block PTY output if snapshot is pending (race condition prevention)
+        if (pss->snapshot_pending) {
+          lwsl_debug("Blocking PTY output for client %s - snapshot pending\n", pss->address);
+          // Don't write, don't free - will retry on next writable callback
+          break;
+        }
+
         wsi_output(wsi, pss->pty_buf);
 
         // Use reference counting in shared mode, direct free in non-shared mode
@@ -1132,9 +1061,10 @@ int callback_tty(struct lws *wsi, enum lws_callback_reasons reason, void *user, 
         // Resume PTY to continue reading
         if (!server->shared_pty_mode && pss->process != NULL) {
           pty_resume(pss->process);
-        } else if (server->shared_pty_mode && server->shared_process != NULL) {
-          // In shared mode, resume the shared PTY after sending data
-          pty_resume(server->shared_process);
+        } else if (server->shared_pty_mode) {
+          if (!shared_session_has_pending_buffers(server) && server->shared_process != NULL) {
+            pty_resume(server->shared_process);
+          }
         }
       }
       break;
@@ -1196,15 +1126,11 @@ int callback_tty(struct lws *wsi, enum lws_callback_reasons reason, void *user, 
           if (server->shared_pty_mode) {
             uint16_t req_cols = 0, req_rows = 0;
             json_object_put(parse_window_size(pss->buffer + 1, pss->len - 1, &req_cols, &req_rows));
-
-            pss->requested_columns = req_cols;
-            pss->requested_rows = req_rows;
-
-            update_shared_session_geometry(server);
-
-            if (server->session_columns > 0 && server->session_rows > 0) {
-              queue_session_resize_for_client(pss, server->session_columns, server->session_rows);
-            }
+            lwsl_notice("Client %s attempted resize to %ux%u; enforcing session geometry %ux%u\n",
+                        pss->address, req_cols, req_rows,
+                        server->session_columns, server->session_rows);
+            pss->pending_session_resize = true;
+            lws_callback_on_writable(wsi);
           } else {
             json_object_put(
                 parse_window_size(pss->buffer + 1, pss->len - 1, &pss->process->columns, &pss->process->rows));
@@ -1221,6 +1147,17 @@ int callback_tty(struct lws *wsi, enum lws_callback_reasons reason, void *user, 
           // Only allow resume in non-shared mode (would affect all clients in shared mode)
           if (!server->shared_pty_mode && pss->process != NULL) {
             pty_resume(pss->process);
+          }
+          break;
+        case SNAPSHOT_ACK:
+          // Client has finished applying snapshot, unblock PTY output
+          if (server->shared_pty_mode && pss->snapshot_pending) {
+            pss->snapshot_pending = false;
+            lwsl_notice("Snapshot acknowledged by client %s, unblocking PTY output\n", pss->address);
+            // Trigger writable callback to flush any pending PTY output
+            if (pss->pty_buf != NULL) {
+              lws_callback_on_writable(wsi);
+            }
           }
           break;
         case JSON_DATA:
@@ -1247,42 +1184,39 @@ int callback_tty(struct lws *wsi, enum lws_callback_reasons reason, void *user, 
           }
           json_object_put(obj);
 
-          // NEW: Shared PTY mode
-          if (server->shared_pty_mode) {
-            // Store requested dimensions for narrowest-client policy
-            pss->requested_columns = columns;
-            pss->requested_rows = rows;
+      // NEW: Shared PTY mode
+      if (server->shared_pty_mode) {
+        lwsl_notice("Client %s reported %ux%u; locking session to %ux%u\n",
+                    pss->address, columns, rows,
+                    server->session_columns, server->session_rows);
 
-            // Create shared process if needed (first client)
-            if (server->shared_process == NULL) {
-              if (!create_shared_process(server, pss, columns, rows)) {
-                lwsl_err("Failed to create shared process\n");
-                return 1;
-              }
-              pss->is_primary_client = true;
-              lwsl_notice("Client %s is primary\n", pss->address);
-            } else {
-              pss->is_primary_client = false;
-              lwsl_notice("Client %s connected to existing shared process\n", pss->address);
-            }
-
-            // Add this client to the tracking list
-            add_client_to_list(server, wsi);
-
-            // Recompute shared session geometry now that the client list changed
-            update_shared_session_geometry(server);
-
-            if (server->session_columns > 0 && server->session_rows > 0) {
-              queue_session_resize_for_client(pss, server->session_columns, server->session_rows);
-            }
-
-            // Trigger initial message sending (don't set initialized yet)
-            lws_callback_on_writable(wsi);
-          } else {
-            // OLD: Per-client PTY mode
-            if (!spawn_process(pss, columns, rows)) return 1;
+        // Create shared process if needed (first client)
+        if (server->shared_process == NULL) {
+          if (!create_shared_process(server, pss)) {
+            lwsl_err("Failed to create shared process\n");
+            return 1;
           }
-          break;
+          pss->is_primary_client = true;
+          lwsl_notice("Client %s is primary\n", pss->address);
+        } else {
+          pss->is_primary_client = false;
+          lwsl_notice("Client %s connected to existing shared process\n", pss->address);
+        }
+
+        // Add this client to the tracking list
+        add_client_to_list(server, wsi);
+
+        // Ensure we send the locked geometry on the next writable callback
+        pss->pending_session_resize = true;
+        pss->resize_sent = false;
+
+        // Trigger initial message sending (don't set initialized yet)
+        lws_callback_on_writable(wsi);
+      } else {
+        // OLD: Per-client PTY mode
+        if (!spawn_process(pss, columns, rows)) return 1;
+      }
+      break;
         default:
           lwsl_warn("ignored unknown message type: %c\n", command);
           break;
@@ -1316,6 +1250,12 @@ int callback_tty(struct lws *wsi, enum lws_callback_reasons reason, void *user, 
           pty_buf_free(pss->pty_buf);
         }
         pss->pty_buf = NULL;
+
+        // If this was the last pending buffer in shared mode, resume the PTY
+        if (server->shared_pty_mode && server->shared_process != NULL &&
+            !shared_session_has_pending_buffers(server)) {
+          pty_resume(server->shared_process);
+        }
       }
       for (int i = 0; i < pss->argc; i++) {
         free(pss->args[i]);

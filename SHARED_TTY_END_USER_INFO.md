@@ -523,9 +523,9 @@ ttyd -Q -W -i 192.168.1.100 bash
 
 ### Resources
 
-- **GitHub Repository**: https://github.com/eastlondoner/ttyd
-- **Test Build Actions**: https://github.com/eastlondoner/ttyd/actions/runs/18620671896
-- **Implementation Plan**: See `SINGLE_TTY_PROCESS_PLAN.md` in repository
+- **GitHub Repository**: https://github.com/tsl0922/ttyd
+- **Implementation History**: See `SHARED_PTY_IMPLEMENTATION_HISTORY.md` in repository
+- **Outstanding Work**: See `SHARED_PTY_OUTSTANDING_WORK.md` in repository
 - **Build Instructions**: See `BUILD_AND_TEST.md` in repository
 
 ### Reporting Issues
@@ -559,7 +559,7 @@ Feedback and bug reports are welcome!
 
 ## Credits
 
-**Implementation**: Based on detailed design in `SINGLE_TTY_PROCESS_PLAN.md`
+**Implementation**: See `SHARED_PTY_IMPLEMENTATION_HISTORY.md` for detailed design and implementation notes
 
 **Original ttyd Author**: Shuanglei Tao (tsl0922)
 

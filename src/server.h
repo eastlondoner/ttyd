@@ -12,6 +12,7 @@
 #define RESIZE_TERMINAL '1'
 #define PAUSE '2'
 #define RESUME '3'
+#define SNAPSHOT_ACK '4'
 #define JSON_DATA '{'
 
 // server message
@@ -63,12 +64,9 @@ struct pss_tty {
   // NEW: Client tracking for shared mode
   bool is_primary_client;      // Is this the first/controlling client?
   int client_index;            // Index in server->client_wsi_list (-1 if not in list)
-  uint16_t requested_columns;  // Last reported geometry from this client
-  uint16_t requested_rows;
-  bool pending_session_resize;     // Whether a session-wide resize needs to be sent
-  uint16_t pending_session_columns;
-  uint16_t pending_session_rows;
+  bool pending_session_resize; // Whether we owe the client a session resize frame
   bool resize_sent;                // Track if initial resize was sent during handshake
+  bool snapshot_pending;           // Snapshot sent but not yet acknowledged
 };
 
 typedef struct {
@@ -107,7 +105,7 @@ struct server {
   struct lws **client_wsi_list;   // Dynamic array of active WebSocket connections
   int client_wsi_capacity;        // Capacity of the array
   int active_client_count;        // Number of active clients in shared mode
-  uint16_t session_columns;       // Session-wide terminal size (narrowest policy)
+  uint16_t session_columns;       // Session-wide terminal width (fixed)
   uint16_t session_rows;
   char *first_client_user;        // Username of first authenticated client (for TTYD_USER)
 
