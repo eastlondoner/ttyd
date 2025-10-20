@@ -109,9 +109,8 @@ struct server {
   uint16_t session_rows;
   char *first_client_user;        // Username of first authenticated client (for TTYD_USER)
 
-  // NEW: libtsm snapshot support (only used in shared_pty_mode)
+  // NEW: libtsm snapshot support (required in shared_pty_mode)
   struct tsm_screen *tsm_screen;  // Terminal screen state machine
   struct tsm_vte *tsm_vte;        // VT100 emulator
   int scrollback_size;            // Scrollback buffer size (default: 2000)
-  bool snapshot_enabled;          // Whether to send snapshots to new clients
 };

@@ -328,7 +328,6 @@ static void init_server(int capacity) {
   server->client_wsi_list = calloc((size_t)capacity, sizeof(struct lws *));
   server->session_columns = 120;
   server->session_rows = 32;
-  server->snapshot_enabled = true;
 }
 
 static struct lws *make_client(struct pss_tty *pss, int slot, bool initialized) {
@@ -549,21 +548,23 @@ static bool test_shared_resume_on_close_when_last_buffer_dropped(void) {
   return true;
 }
 
-static bool test_initial_output_preserved_without_snapshot(void) {
+static bool test_initial_output_flushed_after_snapshot_ack(void) {
   reset_stub_state();
   init_server(1);
-  server->snapshot_enabled = false;
 
   struct pss_tty pss;
   make_client(&pss, 0, false);
   pss.initial_cmd_index = sizeof(initial_cmds);
-  pss.resize_sent = true;
-  pss.pending_session_resize = false;
+  pss.resize_sent = false;
+  pss.pending_session_resize = true;
   pss.snapshot_pending = false;
 
   pty_ctx_t *ctx = NULL;
   pty_process *process = make_shared_process(server, &ctx);
   server->shared_process = process;
+
+  ASSERT_TRUE(init_tsm_screen(server, server->session_columns, server->session_rows),
+              "libtsm initialized");
 
   const char *payload_str = "prompt$ ";
   char *payload = strdup(payload_str);
@@ -575,16 +576,39 @@ static bool test_initial_output_preserved_without_snapshot(void) {
   ASSERT_INT_EQ(buf->ref_count, 1, "buffer retained once per client");
   ASSERT_INT_EQ(writable_call_count, 1, "initial writable scheduled");
 
+  // First writable sends SESSION_RESIZE
   int rc = callback_tty(pss.wsi, LWS_CALLBACK_SERVER_WRITEABLE, &pss, NULL, 0);
-  ASSERT_INT_EQ(rc, 0, "handshake writable processed");
-  ASSERT_TRUE(pss.initialized, "client marked initialized after handshake");
-  ASSERT_PTR_EQ(pss.pty_buf, buf, "buffer still pending post-handshake");
-  ASSERT_INT_EQ(writable_call_count, 2, "flush callback re-queued");
+  ASSERT_INT_EQ(rc, 0, "session resize writable processed");
+  ASSERT_INT_EQ(last_write_cmd, SESSION_RESIZE, "session resize emitted first");
+  ASSERT_TRUE(pss.initialized == false, "client not yet initialized before snapshot");
+  ASSERT_PTR_EQ(pss.pty_buf, buf, "buffer still pending after resize");
+  ASSERT_INT_EQ(writable_call_count, 2, "snapshot scheduled for next writable");
 
   last_write_cmd = 0;
   last_write_payload_len = 0;
   last_write_payload[0] = '\0';
 
+  // Second writable sends SNAPSHOT and marks initialization
+  rc = callback_tty(pss.wsi, LWS_CALLBACK_SERVER_WRITEABLE, &pss, NULL, 0);
+  ASSERT_INT_EQ(rc, 0, "snapshot writable processed");
+  ASSERT_INT_EQ(last_write_cmd, SNAPSHOT, "snapshot emitted after resize");
+  ASSERT_TRUE(pss.snapshot_pending, "snapshot pending flag set");
+  ASSERT_TRUE(pss.initialized, "client marked initialized");
+  ASSERT_PTR_EQ(pss.pty_buf, buf, "buffer waiting while snapshot pending");
+  ASSERT_INT_EQ(writable_call_count, 3, "pending output queued");
+
+  // Client acknowledges snapshot
+  unsigned char ack[1] = {SNAPSHOT_ACK};
+  rc = callback_tty(pss.wsi, LWS_CALLBACK_RECEIVE, &pss, ack, sizeof(ack));
+  ASSERT_INT_EQ(rc, 0, "snapshot ack processed");
+  ASSERT_TRUE(!pss.snapshot_pending, "snapshot flag cleared on ack");
+  ASSERT_INT_EQ(writable_call_count, 4, "writable scheduled after ack");
+
+  last_write_cmd = 0;
+  last_write_payload_len = 0;
+  last_write_payload[0] = '\0';
+
+  // Final writable flushes buffered PTY data
   rc = callback_tty(pss.wsi, LWS_CALLBACK_SERVER_WRITEABLE, &pss, NULL, 0);
   ASSERT_INT_EQ(rc, 0, "flush writable processed");
   ASSERT_INT_EQ(last_write_cmd, OUTPUT, "output frame emitted");
@@ -597,6 +621,7 @@ static bool test_initial_output_preserved_without_snapshot(void) {
 
   free_client(&pss);
   free_shared_process(process, false);
+  cleanup_tsm_screen(server);
   teardown_server();
   return true;
 }
@@ -623,7 +648,6 @@ static bool test_pending_buffer_detected_for_uninitialized_client(void) {
 static bool test_snapshot_preserves_whitespace(void) {
   reset_stub_state();
   init_server(1);
-  server->snapshot_enabled = true;
   server->scrollback_size = 1000;
 
   ASSERT_TRUE(init_tsm_screen(server, 80, 24), "tsm screen initialized");
@@ -770,7 +794,6 @@ static bool test_fixed_geometry_sent_on_handshake(void) {
   init_server(1);
   server->session_columns = 132;
   server->session_rows = 43;
-  server->snapshot_enabled = false;
 
   struct pss_tty pss;
   struct lws *wsi = make_client(&pss, 0, false);
@@ -873,7 +896,7 @@ int main(void) {
       {"shared_read_resumes_after_broadcast", test_shared_read_resumes_after_broadcast},
       {"shared_buffer_released_on_close", test_shared_buffer_released_on_close},
       {"shared_resume_on_close_when_last_buffer_dropped", test_shared_resume_on_close_when_last_buffer_dropped},
-      {"initial_output_preserved_without_snapshot", test_initial_output_preserved_without_snapshot},
+      {"initial_output_flushed_after_snapshot_ack", test_initial_output_flushed_after_snapshot_ack},
       {"pending_buffer_detected_for_uninitialized_client", test_pending_buffer_detected_for_uninitialized_client},
       {"snapshot_preserves_whitespace", test_snapshot_preserves_whitespace},
       {"remove_client_without_initialization", test_remove_client_without_initialization},

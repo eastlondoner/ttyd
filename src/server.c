@@ -182,7 +182,6 @@ static struct server *server_new(int argc, char **argv, int start) {
 
   // Initialize libtsm snapshot settings
   ts->scrollback_size = 2000;  // Default scrollback: 2000 lines
-  ts->snapshot_enabled = true;  // Enable snapshots by default in shared mode
   ts->tsm_screen = NULL;
   ts->tsm_vte = NULL;
   ts->session_columns = 120;

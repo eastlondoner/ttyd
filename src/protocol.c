@@ -322,21 +322,24 @@ static bool create_shared_process(struct server *server, struct pss_tty *first_p
     process->cwd = strdup(server->cwd);
   }
 
+  // Initialize libtsm screen for snapshots (required in shared mode)
+  if (!init_tsm_screen(server, columns, rows)) {
+    lwsl_err("Failed to initialize libtsm screen\n");
+    process_free(process);
+    free(ctx);
+    return false;
+  }
+
   // Spawn the process with shared callbacks
   if (pty_spawn(process, shared_process_read_cb, shared_process_exit_cb) != 0) {
     lwsl_err("pty_spawn failed: %d (%s)\n", errno, strerror(errno));
+    cleanup_tsm_screen(server);
     process_free(process);
     free(ctx);
     return false;
   }
 
   server->shared_process = process;
-
-  // Initialize libtsm screen for snapshots (if enabled)
-  if (!init_tsm_screen(server, columns, rows)) {
-    lwsl_err("Failed to initialize libtsm screen, snapshots will be disabled\n");
-    server->snapshot_enabled = false;
-  }
 
   lwsl_notice("Shared PTY process created (PID: %d, size: %dx%d)\n",
               process->pid, columns, rows);
@@ -567,10 +570,6 @@ static void tsm_write_cb(struct tsm_vte *vte, const char *u8, size_t len, void *
 
 // Initialize libtsm screen and VTE for snapshot support
 static bool init_tsm_screen(struct server *server, uint16_t columns, uint16_t rows) {
-  if (!server->snapshot_enabled) {
-    return true;  // Snapshots disabled, skip initialization
-  }
-
   // Create screen
   int ret = tsm_screen_new(&server->tsm_screen, tsm_log_cb, server);
   if (ret < 0) {
@@ -978,8 +977,8 @@ int callback_tty(struct lws *wsi, enum lws_callback_reasons reason, void *user, 
         }
 
         // After initial messages and resize, send snapshot if in shared mode
-        if (server->shared_pty_mode && server->snapshot_enabled &&
-            server->tsm_screen != NULL && pss->client_index >= 0 && !pss->snapshot_pending) {
+        if (server->shared_pty_mode && server->tsm_screen != NULL &&
+            pss->client_index >= 0 && !pss->snapshot_pending) {
           uint16_t snapshot_cols = server->session_columns;
           uint16_t snapshot_rows = server->session_rows;
           // Generate snapshot sized to the shared session geometry
