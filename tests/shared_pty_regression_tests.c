@@ -549,6 +549,77 @@ static bool test_shared_resume_on_close_when_last_buffer_dropped(void) {
   return true;
 }
 
+static bool test_initial_output_preserved_without_snapshot(void) {
+  reset_stub_state();
+  init_server(1);
+  server->snapshot_enabled = false;
+
+  struct pss_tty pss;
+  make_client(&pss, 0, false);
+  pss.initial_cmd_index = sizeof(initial_cmds);
+  pss.resize_sent = true;
+  pss.pending_session_resize = false;
+  pss.snapshot_pending = false;
+
+  pty_ctx_t *ctx = NULL;
+  pty_process *process = make_shared_process(server, &ctx);
+  server->shared_process = process;
+
+  const char *payload_str = "prompt$ ";
+  char *payload = strdup(payload_str);
+  pty_buf_t *buf = pty_buf_init(payload, strlen(payload));
+
+  shared_process_read_cb(process, buf, false);
+
+  ASSERT_PTR_EQ(pss.pty_buf, buf, "pre-initialized client retains PTY chunk");
+  ASSERT_INT_EQ(buf->ref_count, 1, "buffer retained once per client");
+  ASSERT_INT_EQ(writable_call_count, 1, "initial writable scheduled");
+
+  int rc = callback_tty(pss.wsi, LWS_CALLBACK_SERVER_WRITEABLE, &pss, NULL, 0);
+  ASSERT_INT_EQ(rc, 0, "handshake writable processed");
+  ASSERT_TRUE(pss.initialized, "client marked initialized after handshake");
+  ASSERT_PTR_EQ(pss.pty_buf, buf, "buffer still pending post-handshake");
+  ASSERT_INT_EQ(writable_call_count, 2, "flush callback re-queued");
+
+  last_write_cmd = 0;
+  last_write_payload_len = 0;
+  last_write_payload[0] = '\0';
+
+  rc = callback_tty(pss.wsi, LWS_CALLBACK_SERVER_WRITEABLE, &pss, NULL, 0);
+  ASSERT_INT_EQ(rc, 0, "flush writable processed");
+  ASSERT_INT_EQ(last_write_cmd, OUTPUT, "output frame emitted");
+  ASSERT_INT_EQ((int)last_write_payload_len, (int)strlen(payload_str), "payload length delivered");
+  ASSERT_TRUE(strncmp(last_write_payload, payload_str, strlen(payload_str)) == 0,
+              "expected payload delivered");
+  ASSERT_TRUE(pss.pty_buf == NULL, "buffer cleared after flush");
+  ASSERT_INT_EQ(buf_free_count, 1, "buffer freed after flush");
+  ASSERT_INT_EQ(pty_resume_call_count, 1, "pty resumed after buffer drained");
+
+  free_client(&pss);
+  free_shared_process(process, false);
+  teardown_server();
+  return true;
+}
+
+static bool test_pending_buffer_detected_for_uninitialized_client(void) {
+  reset_stub_state();
+  init_server(1);
+  server->active_client_count = 0;
+
+  struct pss_tty pss;
+  make_client(&pss, 0, false);
+
+  char *payload = strdup("data");
+  pty_buf_t *buf = pty_buf_init(payload, strlen(payload));
+  pss.pty_buf = buf;
+
+  ASSERT_TRUE(shared_session_has_pending_buffers(server), "pending buffer detected");
+
+  free_client(&pss);
+  teardown_server();
+  return true;
+}
+
 static bool test_snapshot_preserves_whitespace(void) {
   reset_stub_state();
   init_server(1);
@@ -802,6 +873,8 @@ int main(void) {
       {"shared_read_resumes_after_broadcast", test_shared_read_resumes_after_broadcast},
       {"shared_buffer_released_on_close", test_shared_buffer_released_on_close},
       {"shared_resume_on_close_when_last_buffer_dropped", test_shared_resume_on_close_when_last_buffer_dropped},
+      {"initial_output_preserved_without_snapshot", test_initial_output_preserved_without_snapshot},
+      {"pending_buffer_detected_for_uninitialized_client", test_pending_buffer_detected_for_uninitialized_client},
       {"snapshot_preserves_whitespace", test_snapshot_preserves_whitespace},
       {"remove_client_without_initialization", test_remove_client_without_initialization},
       {"active_client_count_reset_on_process_exit", test_active_client_count_reset_on_process_exit},

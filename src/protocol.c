@@ -213,7 +213,7 @@ static bool shared_session_has_pending_buffers(struct server *server) {
   for (int i = 0; i < server->client_wsi_capacity; i++) {
     if (server->client_wsi_list[i] == NULL) continue;
     struct pss_tty *pss = get_pss_from_wsi(server->client_wsi_list[i]);
-    if (pss != NULL && pss->initialized && pss->pty_buf != NULL) {
+    if (pss != NULL && pss->pty_buf != NULL) {
       return true;
     }
   }
@@ -376,24 +376,24 @@ static void shared_process_read_cb(pty_process *process, pty_buf_t *buf, bool eo
 
   // Broadcast to ALL connected clients using reference counting
   for (int i = 0; i < server->client_wsi_capacity; i++) {
-    if (server->client_wsi_list[i] != NULL) {
-      struct pss_tty *pss = get_pss_from_wsi(server->client_wsi_list[i]);
+    struct lws *client_wsi = server->client_wsi_list[i];
+    if (client_wsi == NULL) continue;
 
-      if (pss->initialized) {
-        // Check if this client already has a pending buffer that's too large
-        if (pss->pty_buf != NULL && pss->pty_buf->len > MAX_CLIENT_BUFFER_SIZE / 2) {
-          lwsl_warn("Client %d buffer overflow, disconnecting\n", pss->client_index);
-          lws_close_reason(server->client_wsi_list[i], LWS_CLOSE_STATUS_POLICY_VIOLATION,
-                           (unsigned char *)"Buffer overflow", 15);
-          continue;  // Skip this client
-        }
+    struct pss_tty *pss = get_pss_from_wsi(client_wsi);
+    if (pss == NULL) continue;
 
-        // Retain buffer for this client (increments ref_count)
-        pss->pty_buf = pty_buf_retain(buf);
-        lws_callback_on_writable(server->client_wsi_list[i]);
-        delivered++;
-      }
+    // Check if this client already has a pending buffer that's too large
+    if (pss->pty_buf != NULL && pss->pty_buf->len > MAX_CLIENT_BUFFER_SIZE / 2) {
+      lwsl_warn("Client %d buffer overflow, disconnecting\n", pss->client_index);
+      lws_close_reason(client_wsi, LWS_CLOSE_STATUS_POLICY_VIOLATION,
+                       (unsigned char *)"Buffer overflow", 15);
+      continue;  // Skip this client
     }
+
+    // Retain buffer for this client (increments ref_count) even if handshake pending.
+    pss->pty_buf = pty_buf_retain(buf);
+    lws_callback_on_writable(client_wsi);
+    delivered++;
   }
 
   // Release the original reference (buffer will be freed when all clients finish)
