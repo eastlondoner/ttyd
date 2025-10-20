@@ -24,6 +24,8 @@ jobs:
         target: [i686, x86_64, arm, armhf, aarch64, mips, mipsel, mips64, mips64el, s390x, win32]
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - name: Install packages
         run: |
           sudo apt-get update
@@ -49,6 +51,8 @@ jobs:
             arch: x86_64
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - name: Install dependencies
         run: |
           brew install cmake json-c libwebsockets libuv
