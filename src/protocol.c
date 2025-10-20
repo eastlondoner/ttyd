@@ -17,6 +17,66 @@
 // initial message list
 static char initial_cmds[] = {SET_WINDOW_TITLE, SET_PREFERENCES};
 
+struct pending_shared_buffer {
+  pty_buf_t *buf;
+  struct pending_shared_buffer *next;
+};
+
+static void shared_client_buffers_init(struct pss_tty *pss) {
+  if (pss == NULL) return;
+  pss->pending_pty_head = NULL;
+  pss->pending_pty_tail = NULL;
+  pss->pending_pty_bytes = 0;
+  pss->pty_buf = NULL;
+}
+
+static void shared_client_buffers_enqueue(struct pss_tty *pss, pty_buf_t *buf) {
+  if (pss == NULL || buf == NULL) return;
+
+  struct pending_shared_buffer *node = xmalloc(sizeof(struct pending_shared_buffer));
+  node->buf = pty_buf_retain(buf);
+  node->next = NULL;
+
+  if (pss->pending_pty_tail != NULL) {
+    pss->pending_pty_tail->next = node;
+  } else {
+    pss->pending_pty_head = node;
+  }
+
+  pss->pending_pty_tail = node;
+  pss->pending_pty_bytes += buf->len;
+  pss->pty_buf = pss->pending_pty_head != NULL ? pss->pending_pty_head->buf : NULL;
+}
+
+static void shared_client_buffers_pop(struct pss_tty *pss) {
+  if (pss == NULL || pss->pending_pty_head == NULL) return;
+
+  struct pending_shared_buffer *node = pss->pending_pty_head;
+  pss->pending_pty_head = node->next;
+  if (pss->pending_pty_head == NULL) {
+    pss->pending_pty_tail = NULL;
+  }
+
+  if (pss->pending_pty_bytes >= node->buf->len) {
+    pss->pending_pty_bytes -= node->buf->len;
+  } else {
+    pss->pending_pty_bytes = 0;
+  }
+
+  pty_buf_release(node->buf);
+  free(node);
+
+  pss->pty_buf = pss->pending_pty_head != NULL ? pss->pending_pty_head->buf : NULL;
+}
+
+static void shared_client_buffers_clear(struct pss_tty *pss) {
+  if (pss == NULL) return;
+  while (pss->pending_pty_head != NULL) {
+    shared_client_buffers_pop(pss);
+  }
+  pss->pending_pty_bytes = 0;
+}
+
 static int send_initial_message(struct lws *wsi, int index) {
   unsigned char message[LWS_PRE + 1 + 4096];
   unsigned char *p = &message[LWS_PRE];
@@ -385,16 +445,21 @@ static void shared_process_read_cb(pty_process *process, pty_buf_t *buf, bool eo
     struct pss_tty *pss = get_pss_from_wsi(client_wsi);
     if (pss == NULL) continue;
 
-    // Check if this client already has a pending buffer that's too large
-    if (pss->pty_buf != NULL && pss->pty_buf->len > MAX_CLIENT_BUFFER_SIZE / 2) {
-      lwsl_warn("Client %d buffer overflow, disconnecting\n", pss->client_index);
+    size_t pending_bytes = pss->pending_pty_bytes;
+    size_t projected_bytes = pending_bytes + buf_len;
+
+    // Check if this client already has too much buffered data queued
+    if (pending_bytes > MAX_CLIENT_BUFFER_SIZE / 2 || projected_bytes > MAX_CLIENT_BUFFER_SIZE) {
+      lwsl_warn("Client %d buffer overflow (pending=%zu, incoming=%zu), disconnecting\n",
+                pss->client_index, pending_bytes, buf_len);
+      shared_client_buffers_clear(pss);
       lws_close_reason(client_wsi, LWS_CLOSE_STATUS_POLICY_VIOLATION,
                        (unsigned char *)"Buffer overflow", 15);
       continue;  // Skip this client
     }
 
     // Retain buffer for this client (increments ref_count) even if handshake pending.
-    pss->pty_buf = pty_buf_retain(buf);
+    shared_client_buffers_enqueue(pss, buf);
     lws_callback_on_writable(client_wsi);
     delivered++;
   }
@@ -936,6 +1001,7 @@ int callback_tty(struct lws *wsi, enum lws_callback_reasons reason, void *user, 
       pss->pending_session_resize = false;
       pss->resize_sent = false;
       pss->snapshot_pending = false;
+      shared_client_buffers_init(pss);
 
       if (server->url_arg) {
         while (lws_hdr_copy_fragment(wsi, buf, sizeof(buf), WSI_TOKEN_HTTP_URI_ARGS, n++) > 0) {
@@ -1050,12 +1116,15 @@ int callback_tty(struct lws *wsi, enum lws_callback_reasons reason, void *user, 
 
         // Use reference counting in shared mode, direct free in non-shared mode
         if (server->shared_pty_mode) {
-          pty_buf_release(pss->pty_buf);
+          shared_client_buffers_pop(pss);
+          if (pss->pty_buf != NULL) {
+            // More data queued for this client, keep draining
+            lws_callback_on_writable(wsi);
+          }
         } else {
           pty_buf_free(pss->pty_buf);
+          pss->pty_buf = NULL;
         }
-
-        pss->pty_buf = NULL;
 
         // Resume PTY to continue reading
         if (!server->shared_pty_mode && pss->process != NULL) {
@@ -1242,19 +1311,25 @@ int callback_tty(struct lws *wsi, enum lws_callback_reasons reason, void *user, 
 
       // Clean up client resources
       if (pss->buffer != NULL) free(pss->buffer);
-      if (pss->pty_buf != NULL) {
-        if (server->shared_pty_mode) {
+      if (server->shared_pty_mode) {
+        bool had_pending_queue = pss->pending_pty_head != NULL;
+        if (had_pending_queue) {
+          shared_client_buffers_clear(pss);
+        } else if (pss->pty_buf != NULL) {
+          // Defensive: release any stray pointer not tracked in the queue
           pty_buf_release(pss->pty_buf);
-        } else {
-          pty_buf_free(pss->pty_buf);
+          pss->pty_buf = NULL;
+          pss->pending_pty_bytes = 0;
         }
-        pss->pty_buf = NULL;
 
         // If this was the last pending buffer in shared mode, resume the PTY
-        if (server->shared_pty_mode && server->shared_process != NULL &&
+        if (server->shared_process != NULL &&
             !shared_session_has_pending_buffers(server)) {
           pty_resume(server->shared_process);
         }
+      } else if (pss->pty_buf != NULL) {
+        pty_buf_free(pss->pty_buf);
+        pss->pty_buf = NULL;
       }
       for (int i = 0; i < pss->argc; i++) {
         free(pss->args[i]);

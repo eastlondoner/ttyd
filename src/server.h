@@ -42,6 +42,8 @@ struct pss_http {
   size_t len;
 };
 
+struct pending_shared_buffer;
+
 struct pss_tty {
   bool initialized;
   int initial_cmd_index;
@@ -62,6 +64,9 @@ struct pss_tty {
   int lws_close_status;
 
   // NEW: Client tracking for shared mode
+  struct pending_shared_buffer *pending_pty_head;  // Queue of pending PTY buffers (shared mode)
+  struct pending_shared_buffer *pending_pty_tail;
+  size_t pending_pty_bytes;
   bool is_primary_client;      // Is this the first/controlling client?
   int client_index;            // Index in server->client_wsi_list (-1 if not in list)
   bool pending_session_resize; // Whether we owe the client a session resize frame

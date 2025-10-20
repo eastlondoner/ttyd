@@ -32,6 +32,42 @@ which cmake          # Should output: /opt/homebrew/bin/cmake (or similar)
 brew list | grep -E "(json-c|libwebsockets|libuv)"
 ```
 
+### Git Submodules
+
+ttyd uses git submodules to manage third-party dependencies (currently libtsm for terminal snapshot support). Git submodules are separate repositories tracked within the main repository.
+
+**Key points about submodules:**
+
+1. **When cloning:** Use `git clone --recurse-submodules` to automatically fetch submodule content
+2. **Updating submodules:** After pulling changes, run `git submodule update --init --recursive`
+3. **Status check:** Run `git submodule status` to see which commit each submodule is at
+
+**Common submodule commands:**
+
+```bash
+# Initialize and update all submodules (if not already done)
+git submodule update --init --recursive
+
+# Update submodules to latest commits from their remote repositories
+git submodule update --remote
+
+# Check submodule status
+git submodule status
+
+# View which submodules are configured
+git config --file .gitmodules --list
+```
+
+**Troubleshooting submodules:**
+
+If `third_party/libtsm/` is empty or you see build errors about missing libtsm files:
+
+```bash
+# Clean and re-initialize submodules
+git submodule deinit -f .
+git submodule update --init --recursive
+```
+
 ## Building ttyd
 
 ttyd consists of two main components:
@@ -45,8 +81,18 @@ For normal builds, you only need to build the backend. The frontend assets are a
 #### Step 1: Clone the Repository (if not already done)
 
 ```bash
-git clone https://github.com/tsl0922/ttyd.git
+git clone --recurse-submodules https://github.com/tsl0922/ttyd.git
 cd ttyd
+```
+
+**Important:** The `--recurse-submodules` flag ensures that third-party dependencies (like libtsm) are automatically cloned along with the main repository.
+
+**If you already cloned without submodules:**
+
+If you cloned the repository without the `--recurse-submodules` flag, initialize and update submodules manually:
+
+```bash
+git submodule update --init --recursive
 ```
 
 #### Step 2: Create Build Directory
@@ -456,6 +502,7 @@ The build system consists of three GitHub Actions workflows:
    - Linux builds use cross-compilation on Ubuntu runners
    - macOS builds use native compilation on macOS runners (macos-14 for ARM, macos-13 for Intel)
    - Windows builds use cross-compilation with MinGW
+   - **Automatically checks out git submodules** (libtsm) using `submodules: recursive`
 
 2. **`.github/workflows/release.yml`** - Creates releases
    - Triggered when you push a git tag
@@ -676,7 +723,7 @@ Always test workflow changes with a test tag before creating an official release
 ```bash
 sudo apt-get update
 sudo apt-get install -y build-essential cmake git libjson-c-dev libwebsockets-dev
-git clone https://github.com/tsl0922/ttyd.git
+git clone --recurse-submodules https://github.com/tsl0922/ttyd.git
 cd ttyd && mkdir build && cd build
 cmake ..
 make && sudo make install
