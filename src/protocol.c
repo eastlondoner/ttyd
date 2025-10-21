@@ -711,6 +711,11 @@ static void append_sgr(char *buf, size_t *len, const struct tsm_screen_attr *att
   // If attrs haven't changed, do nothing
   if (attrs_equal(attr, last)) return;
 
+  const int fg_code = attr->fccode;
+  const int bg_code = attr->bccode;
+  const bool fg_is_default = (fg_code == TSM_COLOR_FOREGROUND);
+  const bool bg_is_default = (bg_code == TSM_COLOR_BACKGROUND);
+
   // Reset to default first if switching attributes
   if (last != NULL) {
     buf[(*len)++] = '\x1b';
@@ -746,28 +751,28 @@ static void append_sgr(char *buf, size_t *len, const struct tsm_screen_attr *att
   }
 
   // Foreground color (30-37 for standard, 90-97 for bright)
-  if (attr->fccode >= 0 && attr->fccode < 16) {
-    int fg = attr->fccode < 8 ? 30 + attr->fccode : 90 + (attr->fccode - 8);
+  if (fg_code >= 0 && fg_code < 16) {
+    int fg = fg_code < 8 ? 30 + fg_code : 90 + (fg_code - 8);
     *len += snprintf(buf + *len, 16, "%s%d", first ? "" : ";", fg);
     first = false;
-  } else if (attr->fccode >= 16) {
-    *len += snprintf(buf + *len, 16, "%s38;5;%d", first ? "" : ";", attr->fccode);
+  } else if (fg_code >= 16 && fg_code < TSM_COLOR_NUM && !fg_is_default) {
+    *len += snprintf(buf + *len, 16, "%s38;5;%d", first ? "" : ";", fg_code);
     first = false;
-  } else if (attr->fccode < 0) {
+  } else if (fg_code < 0) {
     *len += snprintf(buf + *len, 32, "%s38;2;%u;%u;%u", first ? "" : ";",
                      (unsigned int)attr->fr, (unsigned int)attr->fg, (unsigned int)attr->fb);
     first = false;
   }
 
   // Background color (40-47 for standard, 100-107 for bright)
-  if (attr->bccode >= 0 && attr->bccode < 16) {
-    int bg = attr->bccode < 8 ? 40 + attr->bccode : 100 + (attr->bccode - 8);
+  if (bg_code >= 0 && bg_code < 16) {
+    int bg = bg_code < 8 ? 40 + bg_code : 100 + (bg_code - 8);
     *len += snprintf(buf + *len, 16, "%s%d", first ? "" : ";", bg);
     first = false;
-  } else if (attr->bccode >= 16) {
-    *len += snprintf(buf + *len, 16, "%s48;5;%d", first ? "" : ";", attr->bccode);
+  } else if (bg_code >= 16 && bg_code < TSM_COLOR_NUM && !bg_is_default) {
+    *len += snprintf(buf + *len, 16, "%s48;5;%d", first ? "" : ";", bg_code);
     first = false;
-  } else if (attr->bccode < 0) {
+  } else if (bg_code < 0) {
     *len += snprintf(buf + *len, 32, "%s48;2;%u;%u;%u", first ? "" : ";",
                      (unsigned int)attr->br, (unsigned int)attr->bg, (unsigned int)attr->bb);
     first = false;
