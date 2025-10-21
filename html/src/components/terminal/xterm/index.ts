@@ -541,6 +541,7 @@ export class Xterm {
     @bind
     private applySnapshot(jsonData: string) {
         const { terminal, socket, textEncoder } = this;
+        let ackSent = false;
 
         try {
             const snapshot = JSON.parse(jsonData);
@@ -573,9 +574,15 @@ export class Xterm {
             if (socket?.readyState === WebSocket.OPEN) {
                 socket.send(textEncoder.encode(Command.SNAPSHOT_ACK));
                 console.log('[ttyd] sent snapshot acknowledgment');
+                ackSent = true;
             }
         } catch (e) {
             console.error('[ttyd] failed to apply snapshot:', e);
+        } finally {
+            if (!ackSent && socket?.readyState === WebSocket.OPEN) {
+                socket.send(textEncoder.encode(Command.SNAPSHOT_ACK));
+                console.log('[ttyd] sent snapshot acknowledgment after recoverable error');
+            }
         }
     }
 

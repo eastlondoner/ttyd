@@ -698,6 +698,8 @@ struct snapshot_ctx {
 static bool attrs_equal(const struct tsm_screen_attr *a, const struct tsm_screen_attr *b) {
   if (a == NULL || b == NULL) return false;
   return a->fccode == b->fccode && a->bccode == b->bccode &&
+         a->fr == b->fr && a->fg == b->fg && a->fb == b->fb &&
+         a->br == b->br && a->bg == b->bg && a->bb == b->bb &&
          a->bold == b->bold && a->italic == b->italic &&
          a->underline == b->underline && a->inverse == b->inverse &&
          a->blink == b->blink;
@@ -748,12 +750,26 @@ static void append_sgr(char *buf, size_t *len, const struct tsm_screen_attr *att
     int fg = attr->fccode < 8 ? 30 + attr->fccode : 90 + (attr->fccode - 8);
     *len += snprintf(buf + *len, 16, "%s%d", first ? "" : ";", fg);
     first = false;
+  } else if (attr->fccode >= 16) {
+    *len += snprintf(buf + *len, 16, "%s38;5;%d", first ? "" : ";", attr->fccode);
+    first = false;
+  } else if (attr->fccode < 0) {
+    *len += snprintf(buf + *len, 32, "%s38;2;%u;%u;%u", first ? "" : ";",
+                     (unsigned int)attr->fr, (unsigned int)attr->fg, (unsigned int)attr->fb);
+    first = false;
   }
 
   // Background color (40-47 for standard, 100-107 for bright)
   if (attr->bccode >= 0 && attr->bccode < 16) {
     int bg = attr->bccode < 8 ? 40 + attr->bccode : 100 + (attr->bccode - 8);
     *len += snprintf(buf + *len, 16, "%s%d", first ? "" : ";", bg);
+    first = false;
+  } else if (attr->bccode >= 16) {
+    *len += snprintf(buf + *len, 16, "%s48;5;%d", first ? "" : ";", attr->bccode);
+    first = false;
+  } else if (attr->bccode < 0) {
+    *len += snprintf(buf + *len, 32, "%s48;2;%u;%u;%u", first ? "" : ";",
+                     (unsigned int)attr->br, (unsigned int)attr->bg, (unsigned int)attr->bb);
     first = false;
   }
 
@@ -777,7 +793,7 @@ static int snapshot_draw_cb(struct tsm_screen *con, uint64_t id,
 
   // Ensure line buffer exists (with extra space for ANSI codes)
   if (ctx->line_bufs[posy] == NULL) {
-    ctx->line_bufs[posy] = xmalloc(ctx->width * 32);  // Much larger for ANSI codes
+    ctx->line_bufs[posy] = xmalloc(ctx->width * 64);  // Larger buffer for ANSI + UTF-8
     ctx->line_bufs[posy][0] = '\0';
     ctx->line_pos[posy] = 0;
   }
