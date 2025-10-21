@@ -4,12 +4,13 @@
 #include <getopt.h>
 #include <json.h>
 #include <libwebsockets.h>
-#include <signal.h>
 #include <stdbool.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <stdint.h>
 
 #include "utils.h"
 
@@ -79,12 +80,15 @@ static const struct option options[] = {{"port", required_argument, NULL, 'p'},
                                         {"max-clients", required_argument, NULL, 'm'},
                                         {"once", no_argument, NULL, 'o'},
                                         {"exit-no-conn", no_argument, NULL, 'q'},
+                                        {"shared-pty", no_argument, NULL, 'Q'},
+                                        {"session-width", required_argument, NULL, 'X'},
+                                        {"session-height", required_argument, NULL, 'Y'},
                                         {"browser", no_argument, NULL, 'B'},
                                         {"debug", required_argument, NULL, 'd'},
                                         {"version", no_argument, NULL, 'v'},
                                         {"help", no_argument, NULL, 'h'},
                                         {NULL, 0, 0, 0}};
-static const char *opt_string = "p:i:U:c:H:u:g:s:w:I:b:P:f:6aSC:K:A:Wt:T:Om:oqBd:vh";
+static const char *opt_string = "p:i:U:c:H:u:g:s:w:I:b:P:f:6aSC:K:A:Wt:T:Om:oqQX:Y:Bd:vh";
 
 static void print_help() {
   // clang-format off
@@ -111,6 +115,9 @@ static void print_help() {
           "    -m, --max-clients       Maximum clients to support (default: 0, no limit)\n"
           "    -o, --once              Accept only one client and exit on disconnection\n"
           "    -q, --exit-no-conn      Exit on all clients disconnection\n"
+          "    -Q, --shared-pty        Enable shared PTY mode (all clients share one terminal)\n"
+          "    -X, --session-width     Fixed terminal width in columns (default: 120)\n"
+          "    -Y, --session-height    Fixed terminal height in rows (default: 32)\n"
           "    -B, --browser           Open terminal with the default system browser\n"
           "    -I, --index             Custom index.html path\n"
           "    -b, --base-path         Expected base path for requests coming from a reverse proxy (eg: /mounted/here, max length: 128)\n"
@@ -155,6 +162,7 @@ static void print_config() {
   if (server->max_clients > 0) lwsl_notice("  max clients: %d\n", server->max_clients);
   if (server->once) lwsl_notice("  once: true\n");
   if (server->exit_no_conn) lwsl_notice("  exit_no_conn: true\n");
+  lwsl_notice("  session geometry: %ux%u (locked)\n", server->session_columns, server->session_rows);
   if (server->index != NULL) lwsl_notice("  custom index.html: %s\n", server->index);
   if (server->cwd != NULL) lwsl_notice("  working directory: %s\n", server->cwd);
   if (!server->writable) lwsl_warn("The --writable option is not set, will start in readonly mode\n");
@@ -171,6 +179,14 @@ static struct server *server_new(int argc, char **argv, int start) {
   ts->sig_code = SIGHUP;
   sprintf(ts->terminal_type, "%s", "xterm-256color");
   get_sig_name(ts->sig_code, ts->sig_name, sizeof(ts->sig_name));
+
+  // Initialize libtsm snapshot settings
+  ts->scrollback_size = 2000;  // Default scrollback: 2000 lines
+  ts->tsm_screen = NULL;
+  ts->tsm_vte = NULL;
+  ts->session_columns = 120;
+  ts->session_rows = 32;
+
   if (start == argc) return ts;
 
   int cmd_argc = argc - start;
@@ -221,6 +237,31 @@ static void server_free(struct server *ts) {
     if (!stat(ts->socket_path, &st)) {
       unlink(ts->socket_path);
     }
+  }
+
+  // NEW: Clean up shared PTY resources
+  if (ts->shared_process != NULL) {
+    pty_kill(ts->shared_process, SIGTERM);
+    process_free(ts->shared_process);
+    ts->shared_process = NULL;
+  }
+  if (ts->client_wsi_list != NULL) {
+    free(ts->client_wsi_list);
+    ts->client_wsi_list = NULL;
+  }
+  if (ts->first_client_user != NULL) {
+    free(ts->first_client_user);
+    ts->first_client_user = NULL;
+  }
+
+  // Clean up libtsm resources
+  if (ts->tsm_vte != NULL) {
+    tsm_vte_unref(ts->tsm_vte);
+    ts->tsm_vte = NULL;
+  }
+  if (ts->tsm_screen != NULL) {
+    tsm_screen_unref(ts->tsm_screen);
+    ts->tsm_screen = NULL;
   }
 
   uv_loop_close(ts->loop);
@@ -375,6 +416,25 @@ int main(int argc, char **argv) {
       case 'q':
         server->exit_no_conn = true;
         break;
+      case 'Q':
+        server->shared_pty_mode = true;
+        break;
+      case 'X': {
+        int cols = parse_int("session-width", optarg);
+        if (cols <= 0 || cols > UINT16_MAX) {
+          fprintf(stderr, "ttyd: invalid session width: %s\n", optarg);
+          return -1;
+        }
+        server->session_columns = (uint16_t)cols;
+      } break;
+      case 'Y': {
+        int rows = parse_int("session-height", optarg);
+        if (rows <= 0 || rows > UINT16_MAX) {
+          fprintf(stderr, "ttyd: invalid session height: %s\n", optarg);
+          return -1;
+        }
+        server->session_rows = (uint16_t)rows;
+      } break;
       case 'B':
         browser = true;
         break;
@@ -522,7 +582,12 @@ int main(int argc, char **argv) {
         return -1;
     }
   }
+
+  // Set disableStdin based on writable flag (after command line parsing)
+  json_object_object_add(client_prefs, "disableStdin", json_object_new_boolean(!server->writable));
+
   server->prefs_json = strdup(json_object_to_json_string(client_prefs));
+  lwsl_notice("Client preferences: %s\n", server->prefs_json);
   json_object_put(client_prefs);
 
   if (server->command == NULL || strlen(server->command) == 0) {

@@ -51,6 +51,7 @@ pty_buf_t *pty_buf_init(char *base, size_t len) {
   buf->base = xmalloc(len);
   memcpy(buf->base, base, len);
   buf->len = len;
+  buf->ref_count = 1;  // Initialize reference count
   return buf;
 }
 
@@ -58,6 +59,22 @@ void pty_buf_free(pty_buf_t *buf) {
   if (buf == NULL) return;
   if (buf->base != NULL) free(buf->base);
   free(buf);
+}
+
+// Increment reference count and return the buffer
+pty_buf_t *pty_buf_retain(pty_buf_t *buf) {
+  if (buf == NULL) return NULL;
+  buf->ref_count++;
+  return buf;
+}
+
+// Decrement reference count and free if zero
+void pty_buf_release(pty_buf_t *buf) {
+  if (buf == NULL) return;
+  buf->ref_count--;
+  if (buf->ref_count <= 0) {
+    pty_buf_free(buf);
+  }
 }
 
 static void read_cb(uv_stream_t *stream, ssize_t n, const uv_buf_t *buf) {
@@ -151,6 +168,24 @@ bool pty_resize(pty_process *process) {
   return pResizePseudoConsole(process->pty, size) == S_OK;
 #else
   struct winsize size = {process->rows, process->columns, 0, 0};
+  return ioctl(process->pty, TIOCSWINSZ, &size) == 0;
+#endif
+}
+
+bool pty_resize_set(pty_process *process, uint16_t columns, uint16_t rows) {
+  if (process == NULL) return false;
+  if (columns <= 0 || rows <= 0) return false;
+
+  // Update process dimensions
+  process->columns = columns;
+  process->rows = rows;
+
+  // Apply resize
+#ifdef _WIN32
+  COORD size = {(int16_t) columns, (int16_t) rows};
+  return pResizePseudoConsole(process->pty, size) == S_OK;
+#else
+  struct winsize size = {rows, columns, 0, 0};
   return ioctl(process->pty, TIOCSWINSZ, &size) == 0;
 #endif
 }

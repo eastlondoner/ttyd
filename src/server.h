@@ -4,17 +4,23 @@
 
 #include "pty.h"
 
+// libtsm - Terminal State Machine for snapshots
+#include <libtsm.h>
+
 // client message
 #define INPUT '0'
 #define RESIZE_TERMINAL '1'
 #define PAUSE '2'
 #define RESUME '3'
+#define SNAPSHOT_ACK '4'
 #define JSON_DATA '{'
 
 // server message
 #define OUTPUT '0'
 #define SET_WINDOW_TITLE '1'
 #define SET_PREFERENCES '2'
+#define SNAPSHOT '3'
+#define SESSION_RESIZE '4'
 
 // url paths
 struct endpoints {
@@ -36,6 +42,8 @@ struct pss_http {
   size_t len;
 };
 
+struct pending_shared_buffer;
+
 struct pss_tty {
   bool initialized;
   int initial_cmd_index;
@@ -50,15 +58,27 @@ struct pss_tty {
   char *buffer;
   size_t len;
 
-  pty_process *process;
+  pty_process *process;        // Used when shared_pty_mode = false
   pty_buf_t *pty_buf;
 
   int lws_close_status;
+
+  // NEW: Client tracking for shared mode
+  struct pending_shared_buffer *pending_pty_head;  // Queue of pending PTY buffers (shared mode)
+  struct pending_shared_buffer *pending_pty_tail;
+  size_t pending_pty_bytes;
+  bool is_primary_client;      // Is this the first/controlling client?
+  int client_index;            // Index in server->client_wsi_list (-1 if not in list)
+  bool pending_session_resize; // Whether we owe the client a session resize frame
+  bool resize_sent;                // Track if initial resize was sent during handshake
+  bool snapshot_pending;           // Snapshot sent but not yet acknowledged
 };
 
 typedef struct {
-  struct pss_tty *pss;
+  struct pss_tty *pss;     // Used in non-shared mode
+  struct server *server;   // Used in shared mode (points to server for broadcast)
   bool ws_closed;
+  bool shared_mode;        // Indicates which pointer to use
 } pty_ctx_t;
 
 struct server {
@@ -83,4 +103,19 @@ struct server {
   char terminal_type[30];  // terminal type to report
 
   uv_loop_t *loop;         // the libuv event loop
+
+  // NEW: Shared PTY support
+  bool shared_pty_mode;           // Enable shared PTY mode
+  pty_process *shared_process;    // The one shared PTY process
+  struct lws **client_wsi_list;   // Dynamic array of active WebSocket connections
+  int client_wsi_capacity;        // Capacity of the array
+  int active_client_count;        // Number of active clients in shared mode
+  uint16_t session_columns;       // Session-wide terminal width (fixed)
+  uint16_t session_rows;
+  char *first_client_user;        // Username of first authenticated client (for TTYD_USER)
+
+  // NEW: libtsm snapshot support (required in shared_pty_mode)
+  struct tsm_screen *tsm_screen;  // Terminal screen state machine
+  struct tsm_vte *tsm_vte;        // VT100 emulator
+  int scrollback_size;            // Scrollback buffer size (default: 2000)
 };

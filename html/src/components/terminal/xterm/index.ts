@@ -4,7 +4,6 @@ import { Terminal } from '@xterm/xterm';
 import { CanvasAddon } from '@xterm/addon-canvas';
 import { ClipboardAddon } from '@xterm/addon-clipboard';
 import { WebglAddon } from '@xterm/addon-webgl';
-import { FitAddon } from '@xterm/addon-fit';
 import { WebLinksAddon } from '@xterm/addon-web-links';
 import { ImageAddon } from '@xterm/addon-image';
 import { Unicode11Addon } from '@xterm/addon-unicode11';
@@ -13,14 +12,39 @@ import { ZmodemAddon } from './addons/zmodem';
 
 import '@xterm/xterm/css/xterm.css';
 
-interface TtydTerminal extends Terminal {
-    fit(): void;
-}
-
 declare global {
     interface Window {
-        term: TtydTerminal;
+        term: Terminal;
     }
+}
+
+interface SnapshotPayload {
+    lines: string[];
+    cursor_x: number;
+    cursor_y: number;
+    width: number;
+    height: number;
+    screen_flags?: number;
+    vte_flags?: number;
+}
+
+enum ScreenFlag {
+    INSERT_MODE = 0x01,
+    AUTO_WRAP = 0x02,
+    REL_ORIGIN = 0x04,
+    INVERSE = 0x08,
+    HIDE_CURSOR = 0x10,
+    FIXED_POS = 0x20,
+    ALTERNATE = 0x40,
+}
+
+enum VteFlag {
+    CURSOR_KEY_MODE = 0x0001,
+    KEYPAD_APPLICATION_MODE = 0x0002,
+    INVERSE_SCREEN_MODE = 0x0400,
+    TEXT_CURSOR_MODE = 0x0200,
+    ORIGIN_MODE = 0x0800,
+    AUTO_WRAP_MODE = 0x1000,
 }
 
 enum Command {
@@ -28,12 +52,15 @@ enum Command {
     OUTPUT = '0',
     SET_WINDOW_TITLE = '1',
     SET_PREFERENCES = '2',
+    SNAPSHOT = '3',
+    SESSION_RESIZE = '4',
 
     // client side
     INPUT = '0',
     RESIZE_TERMINAL = '1',
     PAUSE = '2',
     RESUME = '3',
+    SNAPSHOT_ACK = '4',
 }
 type Preferences = ITerminalOptions & ClientOptions;
 
@@ -84,7 +111,6 @@ export class Xterm {
     private pending = 0;
 
     private terminal: Terminal;
-    private fitAddon = new FitAddon();
     private overlayAddon = new OverlayAddon();
     private clipboardAddon = new ClipboardAddon();
     private webLinksAddon = new WebLinksAddon();
@@ -101,6 +127,9 @@ export class Xterm {
     private reconnect = true;
     private doReconnect = true;
     private closeOnDisconnect = false;
+    private sessionCols?: number;
+    private sessionRows?: number;
+    private suppressClientResize = false;
 
     private writeFunc = (data: ArrayBuffer) => this.writeData(new Uint8Array(data));
 
@@ -154,24 +183,20 @@ export class Xterm {
     @bind
     public open(parent: HTMLElement) {
         this.terminal = new Terminal(this.options.termOptions);
-        const { terminal, fitAddon, overlayAddon, clipboardAddon, webLinksAddon } = this;
-        window.term = terminal as TtydTerminal;
-        window.term.fit = () => {
-            this.fitAddon.fit();
-        };
+        const { terminal, overlayAddon, clipboardAddon, webLinksAddon } = this;
+        window.term = terminal;
 
-        terminal.loadAddon(fitAddon);
         terminal.loadAddon(overlayAddon);
         terminal.loadAddon(clipboardAddon);
         terminal.loadAddon(webLinksAddon);
 
         terminal.open(parent);
-        fitAddon.fit();
+        parent.style.overflow = 'auto';
     }
 
     @bind
     private initListeners() {
-        const { terminal, fitAddon, overlayAddon, register, sendData } = this;
+        const { terminal, register, sendData } = this;
         register(
             terminal.onTitleChange(data => {
                 if (data && data !== '' && !this.titleFixed) {
@@ -183,9 +208,15 @@ export class Xterm {
         register(terminal.onBinary(data => sendData(Uint8Array.from(data, v => v.charCodeAt(0)))));
         register(
             terminal.onResize(({ cols, rows }) => {
-                const msg = JSON.stringify({ columns: cols, rows: rows });
-                this.socket?.send(this.textEncoder.encode(Command.RESIZE_TERMINAL + msg));
-                if (this.resizeOverlay) overlayAddon.showOverlay(`${cols}x${rows}`, 300);
+                if (this.suppressClientResize) {
+                    return;
+                }
+
+                if (this.sessionCols !== undefined && this.sessionRows !== undefined) {
+                    if (cols !== this.sessionCols || rows !== this.sessionRows) {
+                        this.forceSessionGeometry(this.sessionCols, this.sessionRows);
+                    }
+                }
             })
         );
         register(
@@ -199,7 +230,6 @@ export class Xterm {
                 this.overlayAddon?.showOverlay('\u2702', 200);
             })
         );
-        register(addEventListener(window, 'resize', () => fitAddon.fit()));
         register(addEventListener(window, 'beforeunload', this.onWindowUnload));
     }
 
@@ -361,6 +391,12 @@ export class Xterm {
                     ...this.parseOptsFromUrlQuery(window.location.search),
                 } as Preferences);
                 break;
+            case Command.SNAPSHOT:
+                this.applySnapshot(textDecoder.decode(data));
+                break;
+            case Command.SESSION_RESIZE:
+                this.applySessionResize(textDecoder.decode(data));
+                break;
             default:
                 console.warn(`[ttyd] unknown command: ${cmd}`);
                 break;
@@ -369,7 +405,7 @@ export class Xterm {
 
     @bind
     private applyPreferences(prefs: Preferences) {
-        const { terminal, fitAddon, register } = this;
+        const { terminal, register } = this;
         if (prefs.enableZmodem || prefs.enableTrzsz) {
             this.zmodemAddon = new ZmodemAddon({
                 zmodem: prefs.enableZmodem,
@@ -462,9 +498,184 @@ export class Xterm {
                     } else {
                         terminal.options[key] = value;
                     }
-                    if (key.indexOf('font') === 0) fitAddon.fit();
+                    if (key.indexOf('font') === 0) {
+                        const targetCols = this.sessionCols ?? terminal.cols;
+                        const targetRows = this.sessionRows ?? terminal.rows;
+                        this.forceSessionGeometry(targetCols, targetRows);
+                    }
                     break;
             }
+        }
+    }
+
+    @bind
+    private forceSessionGeometry(cols: number, rows: number) {
+        if (!this.terminal) {
+            return;
+        }
+
+        if (!Number.isFinite(cols) || !Number.isFinite(rows)) {
+            return;
+        }
+
+        const targetCols = Math.max(1, Math.floor(cols));
+        const targetRows = Math.max(1, Math.floor(rows));
+
+        if (this.terminal.cols === targetCols && this.terminal.rows === targetRows) {
+            return;
+        }
+
+        this.suppressClientResize = true;
+        try {
+            this.terminal.resize(targetCols, targetRows);
+        } finally {
+            this.suppressClientResize = false;
+        }
+
+        if (this.resizeOverlay) {
+            this.overlayAddon.showOverlay(`${targetCols}x${targetRows}`, 300);
+        }
+    }
+
+    @bind
+    private applySessionResize(jsonData: string) {
+        let payload: { columns?: number; rows?: number };
+        try {
+            payload = JSON.parse(jsonData);
+        } catch (e) {
+            console.warn('[ttyd] failed to parse session resize payload', e);
+            return;
+        }
+
+        const { columns, rows } = payload;
+        if (!Number.isFinite(columns) || !Number.isFinite(rows)) {
+            console.warn('[ttyd] invalid session resize payload', payload);
+            return;
+        }
+
+        const width = Math.max(1, Math.floor(columns!));
+        const height = Math.max(1, Math.floor(rows!));
+
+        if (this.sessionCols === width && this.sessionRows === height) {
+            if (this.terminal && this.terminal.cols === width && this.terminal.rows === height) {
+                return;
+            }
+        }
+
+        this.sessionCols = width;
+        this.sessionRows = height;
+        this.forceSessionGeometry(width, height);
+    }
+
+    @bind
+    private applySnapshot(jsonData: string) {
+        const { terminal, socket, textEncoder } = this;
+        let ackSent = false;
+
+        try {
+            const snapshot = JSON.parse(jsonData) as SnapshotPayload;
+            this.applySnapshotModes(snapshot);
+            console.log(
+                `[ttyd] received snapshot: ${snapshot.lines.length} lines, cursor at (${snapshot.cursor_x},${snapshot.cursor_y})`
+            );
+
+            // Use proper ANSI sequences to render the snapshot
+            // This ensures the terminal stays in a proper state for control sequences
+
+            // Clear screen and move cursor to home: ESC[2J ESC[H
+            terminal.write('\x1b[2J\x1b[H');
+
+            // Write each line with proper ANSI positioning
+            for (let i = 0; i < snapshot.lines.length; i++) {
+                if (snapshot.lines[i].length > 0) {
+                    // Position cursor at start of line (row is 1-indexed): ESC[row;1H
+                    terminal.write(`\x1b[${i + 1};1H${snapshot.lines[i]}`);
+                }
+            }
+
+            // Position cursor at the saved position (1-indexed): ESC[row;colH
+            const row = snapshot.cursor_y + 1;
+            const col = snapshot.cursor_x + 1;
+            terminal.write(`\x1b[${row};${col}H`);
+
+            console.log('[ttyd] snapshot applied successfully');
+
+            // Send acknowledgment to server to unblock PTY output
+            if (socket?.readyState === WebSocket.OPEN) {
+                socket.send(textEncoder.encode(Command.SNAPSHOT_ACK));
+                console.log('[ttyd] sent snapshot acknowledgment');
+                ackSent = true;
+            }
+        } catch (e) {
+            console.error('[ttyd] failed to apply snapshot:', e);
+        } finally {
+            if (!ackSent && socket?.readyState === WebSocket.OPEN) {
+                socket.send(textEncoder.encode(Command.SNAPSHOT_ACK));
+                console.log('[ttyd] sent snapshot acknowledgment after recoverable error');
+            }
+        }
+    }
+
+    @bind
+    private applySnapshotModes(snapshot: SnapshotPayload) {
+        const { terminal } = this;
+        const state = {
+            altScreen: undefined as boolean | undefined,
+            showCursor: undefined as boolean | undefined,
+            inverse: undefined as boolean | undefined,
+            insertMode: undefined as boolean | undefined,
+            originMode: undefined as boolean | undefined,
+            autoWrap: undefined as boolean | undefined,
+            cursorKeyMode: undefined as boolean | undefined,
+            keypadApplication: undefined as boolean | undefined,
+        };
+
+        if (typeof snapshot.screen_flags === 'number') {
+            const flags = snapshot.screen_flags;
+            state.altScreen = (flags & ScreenFlag.ALTERNATE) !== 0;
+            state.showCursor = (flags & ScreenFlag.HIDE_CURSOR) === 0;
+            state.inverse = (flags & ScreenFlag.INVERSE) !== 0;
+            state.insertMode = (flags & ScreenFlag.INSERT_MODE) !== 0;
+        }
+
+        if (typeof snapshot.vte_flags === 'number') {
+            const flags = snapshot.vte_flags;
+            state.cursorKeyMode = (flags & VteFlag.CURSOR_KEY_MODE) !== 0;
+            state.keypadApplication = (flags & VteFlag.KEYPAD_APPLICATION_MODE) !== 0;
+            state.originMode = (flags & VteFlag.ORIGIN_MODE) !== 0;
+            state.autoWrap = (flags & VteFlag.AUTO_WRAP_MODE) !== 0;
+            if (state.inverse === undefined) {
+                state.inverse = (flags & VteFlag.INVERSE_SCREEN_MODE) !== 0;
+            }
+            if (state.showCursor === undefined) {
+                state.showCursor = (flags & VteFlag.TEXT_CURSOR_MODE) !== 0;
+            }
+        }
+
+        let controlSeq = '';
+        const setDecPrivateMode = (code: number, enable: boolean | undefined) => {
+            if (enable === undefined) return;
+            controlSeq += `\x1b[?${code}${enable ? 'h' : 'l'}`;
+        };
+        const setMode = (code: number, enable: boolean | undefined) => {
+            if (enable === undefined) return;
+            controlSeq += `\x1b[${code}${enable ? 'h' : 'l'}`;
+        };
+
+        setDecPrivateMode(1049, state.altScreen);
+        setDecPrivateMode(25, state.showCursor);
+        setDecPrivateMode(5, state.inverse);
+        setMode(4, state.insertMode);
+        setDecPrivateMode(6, state.originMode);
+        setDecPrivateMode(7, state.autoWrap);
+        setDecPrivateMode(1, state.cursorKeyMode);
+
+        if (state.keypadApplication !== undefined) {
+            controlSeq += state.keypadApplication ? '\x1b=' : '\x1b>';
+        }
+
+        if (controlSeq !== '') {
+            terminal.write(controlSeq);
         }
     }
 

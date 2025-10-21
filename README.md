@@ -15,6 +15,7 @@ ttyd is a simple command-line tool for sharing terminal over the web.
 
 - Built on top of [libuv](https://libuv.org) and [WebGL2](https://developer.mozilla.org/en-US/docs/Web/API/WebGL_API) for speed
 - Fully-featured terminal with [CJK](https://en.wikipedia.org/wiki/CJK_characters) and IME support
+- Shared PTY mode for collaborative terminal sessions (like tmux/screen over the web)
 - [ZMODEM](https://en.wikipedia.org/wiki/ZMODEM) ([lrzsz](https://ohse.de/uwe/software/lrzsz.html)) / [trzsz](https://trzsz.github.io) file transfer support
 - [Sixel](https://en.wikipedia.org/wiki/Sixel) image output support ([img2sixel](https://saitoha.github.io/libsixel) / [lsix](https://github.com/hackerb9/lsix))
 - SSL support based on [OpenSSL](https://www.openssl.org) / [Mbed TLS](https://github.com/Mbed-TLS/mbedtls)
@@ -40,7 +41,7 @@ ttyd is a simple command-line tool for sharing terminal over the web.
     ```bash
     sudo apt-get update
     sudo apt-get install -y build-essential cmake git libjson-c-dev libwebsockets-dev
-    git clone https://github.com/tsl0922/ttyd.git
+    git clone --recurse-submodules https://github.com/tsl0922/ttyd.git
     cd ttyd && mkdir build && cd build
     cmake ..
     make && sudo make install
@@ -82,6 +83,7 @@ OPTIONS:
     -m, --max-clients       Maximum clients to support (default: 0, no limit)
     -o, --once              Accept only one client and exit on disconnection
     -q, --exit-no-conn      Exit on all clients disconnection
+    -Q, --shared-pty        Enable shared PTY mode (multiple clients share one terminal process)
     -B, --browser           Open terminal with the default system browser
     -I, --index             Custom index.html path
     -b, --base-path         Expected base path for requests coming from a reverse proxy (eg: /mounted/here, max length: 128)
@@ -97,6 +99,43 @@ OPTIONS:
 ```
 
 Read the example usage on the [wiki](https://github.com/tsl0922/ttyd/wiki/Example-Usage).
+
+## Shared PTY Mode
+
+Enable shared terminal mode to allow multiple clients to connect to the same terminal session:
+
+```bash
+ttyd --shared-pty bash
+```
+
+All connected clients will:
+- See the same output in real-time
+- Share input when writable mode is enabled (use `-W` flag)
+- Share the same terminal dimensions (uses max dimensions from all clients)
+- Disconnect when the process exits
+
+**Use cases:**
+- Live coding demonstrations and presentations
+- Collaborative debugging sessions
+- Remote pair programming
+- Real-time terminal sharing without tmux/screen
+
+**Example with writable mode:**
+```bash
+ttyd -Q -W bash
+```
+
+**Limitations:**
+- URL arguments (`-a` flag) are not supported in shared mode
+- All clients share the same environment (first client's user for `TTYD_USER`)
+- Multiple simultaneous writers can create confusing input
+- Terminal is sized to accommodate the largest client window
+
+**Best practices:**
+- Coordinate who types using external communication (voice chat, etc.)
+- Use read-only mode (default) for presentations and demos
+- Enable writable mode (`-W`) only for trusted collaborators
+- First client to connect determines initial environment and user
 
 ## Browser Support
 

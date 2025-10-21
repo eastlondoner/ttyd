@@ -21,9 +21,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [i686, x86_64, arm, armhf, aarch64, mips, mipsel, mips64, mips64el, s390x, win32]
+        target: [i686, x86_64, arm, armhf, aarch64, mips, mipsel, mips64, mips64el, s390x]
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - name: Install packages
         run: |
           sudo apt-get update
@@ -36,4 +38,32 @@ jobs:
         with:
           name: ttyd.${{ matrix.target }}
           path: build/ttyd*
+
+  macos:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            arch: arm64
+          - os: macos-13
+            arch: x86_64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install dependencies
+        run: |
+          brew install cmake json-c libwebsockets libuv
+      - name: Build for macOS (${{ matrix.arch }})
+        run: |
+          mkdir -p build && cd build
+          cmake ..
+          make
+          file ttyd
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ttyd.macos-${{ matrix.arch }}
+          path: build/ttyd
 
