@@ -916,6 +916,14 @@ static char *serialize_snapshot(struct server *server, uint16_t cols, uint16_t r
   json_object_object_add(snapshot, "cursor_y", json_object_new_int(cursor_y));
   json_object_object_add(snapshot, "width", json_object_new_int(cols));
   json_object_object_add(snapshot, "height", json_object_new_int(rows));
+  if (server->tsm_screen != NULL) {
+    unsigned int screen_flags = tsm_screen_get_flags(server->tsm_screen);
+    json_object_object_add(snapshot, "screen_flags", json_object_new_int((int)screen_flags));
+  }
+  if (server->tsm_vte != NULL) {
+    unsigned int vte_flags = tsm_vte_get_flags(server->tsm_vte);
+    json_object_object_add(snapshot, "vte_flags", json_object_new_int((int)vte_flags));
+  }
 
   // Convert to string
   const char *json_str = json_object_to_json_string(snapshot);

@@ -18,6 +18,35 @@ declare global {
     }
 }
 
+interface SnapshotPayload {
+    lines: string[];
+    cursor_x: number;
+    cursor_y: number;
+    width: number;
+    height: number;
+    screen_flags?: number;
+    vte_flags?: number;
+}
+
+enum ScreenFlag {
+    INSERT_MODE = 0x01,
+    AUTO_WRAP = 0x02,
+    REL_ORIGIN = 0x04,
+    INVERSE = 0x08,
+    HIDE_CURSOR = 0x10,
+    FIXED_POS = 0x20,
+    ALTERNATE = 0x40,
+}
+
+enum VteFlag {
+    CURSOR_KEY_MODE = 0x0001,
+    KEYPAD_APPLICATION_MODE = 0x0002,
+    INVERSE_SCREEN_MODE = 0x0400,
+    TEXT_CURSOR_MODE = 0x0200,
+    ORIGIN_MODE = 0x0800,
+    AUTO_WRAP_MODE = 0x1000,
+}
+
 enum Command {
     // server side
     OUTPUT = '0',
@@ -544,7 +573,8 @@ export class Xterm {
         let ackSent = false;
 
         try {
-            const snapshot = JSON.parse(jsonData);
+            const snapshot = JSON.parse(jsonData) as SnapshotPayload;
+            this.applySnapshotModes(snapshot);
             console.log(
                 `[ttyd] received snapshot: ${snapshot.lines.length} lines, cursor at (${snapshot.cursor_x},${snapshot.cursor_y})`
             );
@@ -583,6 +613,69 @@ export class Xterm {
                 socket.send(textEncoder.encode(Command.SNAPSHOT_ACK));
                 console.log('[ttyd] sent snapshot acknowledgment after recoverable error');
             }
+        }
+    }
+
+    @bind
+    private applySnapshotModes(snapshot: SnapshotPayload) {
+        const { terminal } = this;
+        const state = {
+            altScreen: undefined as boolean | undefined,
+            showCursor: undefined as boolean | undefined,
+            inverse: undefined as boolean | undefined,
+            insertMode: undefined as boolean | undefined,
+            originMode: undefined as boolean | undefined,
+            autoWrap: undefined as boolean | undefined,
+            cursorKeyMode: undefined as boolean | undefined,
+            keypadApplication: undefined as boolean | undefined,
+        };
+
+        if (typeof snapshot.screen_flags === 'number') {
+            const flags = snapshot.screen_flags;
+            state.altScreen = (flags & ScreenFlag.ALTERNATE) !== 0;
+            state.showCursor = (flags & ScreenFlag.HIDE_CURSOR) === 0;
+            state.inverse = (flags & ScreenFlag.INVERSE) !== 0;
+            state.insertMode = (flags & ScreenFlag.INSERT_MODE) !== 0;
+        }
+
+        if (typeof snapshot.vte_flags === 'number') {
+            const flags = snapshot.vte_flags;
+            state.cursorKeyMode = (flags & VteFlag.CURSOR_KEY_MODE) !== 0;
+            state.keypadApplication = (flags & VteFlag.KEYPAD_APPLICATION_MODE) !== 0;
+            state.originMode = (flags & VteFlag.ORIGIN_MODE) !== 0;
+            state.autoWrap = (flags & VteFlag.AUTO_WRAP_MODE) !== 0;
+            if (state.inverse === undefined) {
+                state.inverse = (flags & VteFlag.INVERSE_SCREEN_MODE) !== 0;
+            }
+            if (state.showCursor === undefined) {
+                state.showCursor = (flags & VteFlag.TEXT_CURSOR_MODE) !== 0;
+            }
+        }
+
+        let controlSeq = '';
+        const setDecPrivateMode = (code: number, enable: boolean | undefined) => {
+            if (enable === undefined) return;
+            controlSeq += `\x1b[?${code}${enable ? 'h' : 'l'}`;
+        };
+        const setMode = (code: number, enable: boolean | undefined) => {
+            if (enable === undefined) return;
+            controlSeq += `\x1b[${code}${enable ? 'h' : 'l'}`;
+        };
+
+        setDecPrivateMode(1049, state.altScreen);
+        setDecPrivateMode(25, state.showCursor);
+        setDecPrivateMode(5, state.inverse);
+        setMode(4, state.insertMode);
+        setDecPrivateMode(6, state.originMode);
+        setDecPrivateMode(7, state.autoWrap);
+        setDecPrivateMode(1, state.cursorKeyMode);
+
+        if (state.keypadApplication !== undefined) {
+            controlSeq += state.keypadApplication ? '\x1b=' : '\x1b>';
+        }
+
+        if (controlSeq !== '') {
+            terminal.write(controlSeq);
         }
     }
 
