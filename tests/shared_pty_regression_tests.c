@@ -930,27 +930,28 @@ static bool test_global_cap_soft_drop(void) {
   server->global_pending_bytes = 0;
 
   // Simulate client B having accumulated data (above soft-drop threshold but below hard overflow)
-  // Soft drop threshold: 40% of MAX_CLIENT_BUFFER_SIZE = 409.6 KB
+  // Soft drop threshold: 30% of MAX_CLIENT_BUFFER_SIZE = 307.2 KB
   // Hard overflow: pending > 50% (512 KB) OR projected > 100% (1 MB)
-  // Set client B to 45% so it triggers soft-drop but not hard overflow
-  pss_b.pending_pty_bytes = (MAX_CLIENT_BUFFER_SIZE * 45) / 100;  // 460.8 KB
+  // Set client B to 35% so it triggers soft-drop but not hard overflow (gives 15% recovery window)
+  pss_b.pending_pty_bytes = (MAX_CLIENT_BUFFER_SIZE * 35) / 100;  // 358.4 KB
 
   char *payload = strdup("large-chunk");  // ~11 bytes
   pty_buf_t *buf = pty_buf_init(payload, strlen(payload));
 
   ASSERT_INT_EQ(server->active_client_count, 3, "three clients active");
   
-  // projected_global = 0 + (11 * 3) = 33 bytes > 20 bytes cap
-  // This should trigger soft-drop for client B (above 50% cap)
+  // Global cap is 20 bytes. Client A (0 bytes) gets buffer: global = 11.
+  // Client B (above 30% threshold) would push global to 22 > 20, so soft-dropped.
+  // Client C (0 bytes) gets buffer: global = 22 (still delivers to low-pending clients first).
   shared_process_read_cb(process, buf, false);
 
-  // With global cap pressure, client B (above 50% cap) should be soft-dropped
-  ASSERT_PTR_EQ(pss_a.pty_buf, buf, "client A received buffer");
-  ASSERT_TRUE(pss_b.pty_buf == NULL, "client B soft-dropped (above 50% cap)");
-  ASSERT_PTR_EQ(pss_c.pty_buf, buf, "client C received buffer");
+  // Client A and C should receive (low pending), Client B should be soft-dropped (above threshold)
+  ASSERT_PTR_EQ(pss_a.pty_buf, buf, "client A received buffer (low pending)");
+  ASSERT_TRUE(pss_b.pty_buf == NULL, "client B soft-dropped (above 30% threshold)");
+  ASSERT_PTR_EQ(pss_c.pty_buf, buf, "client C received buffer (low pending)");
   ASSERT_TRUE(pss_b.soft_dropped_bytes == buf->len, "soft drop bytes tracked for client B");
   
-  // Global count should only include A and C
+  // Global count should include A and C only
   ASSERT_TRUE(server->global_pending_bytes == buf->len * 2, "global count excludes soft-dropped");
 
   free_client(&pss_a);

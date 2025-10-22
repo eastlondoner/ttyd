@@ -13,7 +13,7 @@
 
 // Buffer overflow protection - max buffer size per client
 #define MAX_CLIENT_BUFFER_SIZE (1024 * 1024)  // 1MB per client
-#define SOFT_DROP_THRESHOLD (MAX_CLIENT_BUFFER_SIZE * 4 / 10)  // 40% of max (400KB)
+#define SOFT_DROP_THRESHOLD (MAX_CLIENT_BUFFER_SIZE * 3 / 10)  // 30% of max (307KB)
 
 // initial message list
 static char initial_cmds[] = {SET_WINDOW_TITLE, SET_PREFERENCES};
@@ -536,9 +536,6 @@ static void shared_process_read_cb(pty_process *process, pty_buf_t *buf, bool eo
     lwsl_debug("Fed %zu bytes to libtsm VTE\n", buf_len);
   }
 
-  // Check if we would exceed global cap with this broadcast
-  size_t projected_global = server->global_pending_bytes + (buf_len * (server->active_client_count - skipped_pending));
-  bool global_cap_pressure = projected_global > server->max_global_pending_bytes;
   int soft_dropped = 0;
   
   // Broadcast to ALL connected clients using reference counting
@@ -570,16 +567,22 @@ static void shared_process_read_cb(pty_process *process, pty_buf_t *buf, bool eo
       continue;  // Skip this client
     }
 
-    // Soft drop: skip clients above soft-drop threshold if global cap pressure
-    if (global_cap_pressure && pending_bytes > SOFT_DROP_THRESHOLD) {
+    // Check global cap BEFORE enqueuing this client's buffer
+    // This ensures accurate accounting and prevents projection errors
+    size_t projected_global = server->global_pending_bytes + buf_len;
+    bool would_exceed_cap = projected_global > server->max_global_pending_bytes;
+    
+    // Soft drop: skip clients above threshold when global cap would be exceeded
+    if (would_exceed_cap && pending_bytes > SOFT_DROP_THRESHOLD) {
       soft_dropped++;
       pss->soft_dropped_bytes += buf_len;
-      lwsl_debug("Soft drop: client %d above threshold (pending=%zu > %zu), skipping %zu bytes\n",
-                 pss->client_index, pending_bytes, SOFT_DROP_THRESHOLD, buf_len);
+      lwsl_debug("Soft drop: client %d (pending=%zu > threshold=%zu), would exceed global cap (%zu + %zu > %zu)\n",
+                 pss->client_index, pending_bytes, (size_t)SOFT_DROP_THRESHOLD,
+                 server->global_pending_bytes, buf_len, server->max_global_pending_bytes);
       continue;
     }
 
-    // Retain buffer for this client (increments ref_count) even if handshake pending.
+    // Retain buffer for this client (increments ref_count and global counter)
     shared_client_buffers_enqueue(pss, buf);
     lws_callback_on_writable(client_wsi);
     delivered++;
@@ -592,7 +595,7 @@ static void shared_process_read_cb(pty_process *process, pty_buf_t *buf, bool eo
   pty_resume(server->shared_process);
   
   // Log broadcast results
-  if (global_cap_pressure || soft_dropped > 0) {
+  if (soft_dropped > 0) {
     lwsl_notice("Broadcast %zu bytes: delivered=%d, soft_dropped=%d (global: %zu/%zu bytes), skipped_pending=%d, overflow=%d, active=%d\n",
                 buf_len, delivered, soft_dropped, server->global_pending_bytes, 
                 server->max_global_pending_bytes, skipped_pending, disconnected_overflow, server->active_client_count);
