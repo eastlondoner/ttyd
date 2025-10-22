@@ -343,8 +343,14 @@ static void snapshot_timeout_cb(uv_timer_t *timer) {
   struct server *server = timer->data;
   uint64_t now = uv_now(server->loop);
   
+  // Early exit if no clients or list not initialized
+  if (server->client_wsi_capacity <= 0 || server->client_wsi_list == NULL) {
+    return;
+  }
+  
   // Collect timed-out clients first to avoid modifying list during iteration
-  struct lws *timed_out[server->client_wsi_capacity];
+  // Use dynamic allocation to avoid stack overflow with large client capacities
+  struct lws **timed_out = xmalloc(server->client_wsi_capacity * sizeof(struct lws *));
   int timed_out_count = 0;
   
   for (int i = 0; i < server->client_wsi_capacity; i++) {
@@ -371,6 +377,8 @@ static void snapshot_timeout_cb(uv_timer_t *timer) {
     // Nudge close progression
     lws_callback_on_writable(timed_out[i]);
   }
+  
+  free(timed_out);
 }
 
 // Create shared PTY process (called for first client only)
@@ -1165,7 +1173,14 @@ int callback_tty(struct lws *wsi, enum lws_callback_reasons reason, void *user, 
 
             // Mark snapshot as pending - block PTY output until acknowledged
             pss->snapshot_pending = true;
-            pss->snapshot_sent_at_ms = server->loop ? uv_now(server->loop) : 0;
+            if (server->loop != NULL) {
+              pss->snapshot_sent_at_ms = uv_now(server->loop);
+            } else {
+              // Defensive: in production, loop should never be NULL in shared mode
+              // In test environments without proper loop setup, skip timeout tracking
+              lwsl_warn("server->loop is NULL when setting snapshot timestamp - timeout disabled for this client\n");
+              pss->snapshot_sent_at_ms = UINT64_MAX;  // Never timeout
+            }
             lwsl_notice("Sent snapshot to client %s (%d bytes), blocking PTY output\n", pss->address, (int)json_len);
           }
         }
