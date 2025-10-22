@@ -11,6 +11,14 @@
 #include "server.h"
 #include "utils.h"
 
+// Access to environment variables
+#if defined(__APPLE__)
+#include <crt_externs.h>
+#define environ (*_NSGetEnviron())
+#else
+extern char **environ;
+#endif
+
 // Buffer overflow protection - max buffer size per client
 #define MAX_CLIENT_BUFFER_SIZE (1024 * 1024)  // 1MB per client
 #define SOFT_DROP_THRESHOLD (MAX_CLIENT_BUFFER_SIZE * 3 / 10)  // 30% of max (307KB)
@@ -690,18 +698,41 @@ static char **build_args(struct pss_tty *pss) {
   return argv;
 }
 
-static char **build_env(struct pss_tty *pss) {
-  int i = 0, n = 2;
-  char **envp = xmalloc(n * sizeof(char *));
+// Helper function to check if an env var name matches a key
+static bool env_var_matches(const char *env_var, const char *key) {
+  size_t key_len = strlen(key);
+  return strncmp(env_var, key, key_len) == 0 && env_var[key_len] == '=';
+}
 
-  // TERM
+static char **build_env(struct pss_tty *pss) {
+  // Count existing environment variables
+  int env_count = 0;
+  if (environ != NULL) {
+    for (char **p = environ; *p != NULL; p++) {
+      env_count++;
+    }
+  }
+
+  // Allocate space for all env vars plus potential additions
+  char **envp = xmalloc((env_count + 3) * sizeof(char *));
+  int i = 0;
+
+  // Copy all existing environment variables except TERM and TTYD_USER (we'll override those)
+  if (environ != NULL) {
+    for (char **p = environ; *p != NULL; p++) {
+      if (!env_var_matches(*p, "TERM") && !env_var_matches(*p, "TTYD_USER")) {
+        envp[i++] = strdup(*p);
+      }
+    }
+  }
+
+  // Set TERM
   envp[i] = xmalloc(36);
   snprintf(envp[i], 36, "TERM=%s", server->terminal_type);
   i++;
 
-  // TTYD_USER
+  // Set TTYD_USER
   if (strlen(pss->user) > 0) {
-    envp = xrealloc(envp, (++n) * sizeof(char *));
     envp[i] = xmalloc(40);
     snprintf(envp[i], 40, "TTYD_USER=%s", pss->user);
     i++;
@@ -727,17 +758,34 @@ static char **build_args_from_server(struct server *server) {
 
 // NEW: Build environment from server config (shared mode)
 static char **build_env_from_server(struct server *server) {
-  int i = 0, n = 2;
-  char **envp = xmalloc(n * sizeof(char *));
+  // Count existing environment variables
+  int env_count = 0;
+  if (environ != NULL) {
+    for (char **p = environ; *p != NULL; p++) {
+      env_count++;
+    }
+  }
 
-  // TERM
+  // Allocate space for all env vars plus potential additions
+  char **envp = xmalloc((env_count + 3) * sizeof(char *));
+  int i = 0;
+
+  // Copy all existing environment variables except TERM and TTYD_USER (we'll override those)
+  if (environ != NULL) {
+    for (char **p = environ; *p != NULL; p++) {
+      if (!env_var_matches(*p, "TERM") && !env_var_matches(*p, "TTYD_USER")) {
+        envp[i++] = strdup(*p);
+      }
+    }
+  }
+
+  // Set TERM
   envp[i] = xmalloc(36);
   snprintf(envp[i], 36, "TERM=%s", server->terminal_type);
   i++;
 
-  // TTYD_USER (use first_client_user if set)
+  // Set TTYD_USER (use first_client_user if set)
   if (server->first_client_user != NULL && strlen(server->first_client_user) > 0) {
-    envp = xrealloc(envp, (++n) * sizeof(char *));
     envp[i] = xmalloc(40);
     snprintf(envp[i], 40, "TTYD_USER=%s", server->first_client_user);
     i++;
