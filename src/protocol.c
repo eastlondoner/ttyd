@@ -811,19 +811,26 @@ static void tsm_log_cb(void *data, const char *file, int line, const char *fn,
 
 // libtsm write callback - sends data back to PTY (e.g., for responses to queries)
 static void tsm_write_cb(struct tsm_vte *vte, const char *u8, size_t len, void *data) {
-  // NOTE: We intentionally do NOT write VTE responses back to the PTY.
-  // libtsm is only used server-side for snapshot generation, not for terminal emulation.
-  // The actual terminal emulation happens in the browser via xterm.js.
+  struct server *server = (struct server *)data;
+  
+  // Only respond to terminal queries when NO clients are attached.
+  // This prevents TUI apps (like cursor) from timing out when they send cursor position
+  // queries (CSI 6n) before any web client has connected to provide a terminal emulator.
   //
-  // If we wrote VTE responses (e.g., OSC color query responses like "10;rgb:d2d2/d2d2/d2d2")
-  // back to the PTY, they would get broadcast to all connected clients, causing weird
-  // escape sequences to appear in everyone's terminal.
-  //
-  // Therefore, this callback is intentionally a no-op.
-  (void)vte;
-  (void)u8;
-  (void)len;
-  (void)data;
+  // When clients ARE attached, xterm.js in the browser handles all terminal queries,
+  // so we don't respond here to avoid:
+  // 1. Double responses (both libtsm and xterm.js responding)
+  // 2. Broadcasting escape sequences to all clients
+  if (server->active_client_count == 0 && server->shared_process != NULL) {
+    lwsl_debug("libtsm auto-responding to terminal query (%zu bytes) - no clients attached\n", len);
+    pty_buf_t *response = pty_buf_init((char *)u8, len);
+    int err = pty_write(server->shared_process, response);
+    if (err) {
+      lwsl_warn("Failed to write VTE response to PTY: %s (%s)\n", uv_err_name(err), uv_strerror(err));
+    }
+  }
+  
+  (void)vte;  // Suppress unused parameter warning
 }
 
 // Initialize libtsm screen and VTE for snapshot support
