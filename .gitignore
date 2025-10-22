@@ -53,5 +53,7 @@ build
 # Project files
 !init.d
 # SpecStory explanation file
-.specstory/.what-is-this.md
+.specstory/*
 .repomix-output.txt
+# SpecStory explanation file
+.specstory/.what-is-this.md

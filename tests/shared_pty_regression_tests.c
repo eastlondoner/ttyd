@@ -914,6 +914,53 @@ static bool test_client_resize_request_reasserts_geometry(void) {
   return true;
 }
 
+static bool test_global_cap_soft_drop(void) {
+  reset_stub_state();
+  init_server(3);
+  server->active_client_count = 0;
+  server->max_global_pending_bytes = 20;  // Set very low cap to trigger pressure
+
+  struct pss_tty pss_a, pss_b, pss_c;
+  make_client(&pss_a, 0, true);
+  make_client(&pss_b, 1, true);
+  make_client(&pss_c, 2, true);
+
+  pty_ctx_t *ctx = NULL;
+  pty_process *process = make_shared_process(server, &ctx);
+  server->global_pending_bytes = 0;
+
+  // Simulate client B having accumulated data (above soft-drop threshold but below hard overflow)
+  // Soft drop threshold: 40% of MAX_CLIENT_BUFFER_SIZE = 409.6 KB
+  // Hard overflow: pending > 50% (512 KB) OR projected > 100% (1 MB)
+  // Set client B to 45% so it triggers soft-drop but not hard overflow
+  pss_b.pending_pty_bytes = (MAX_CLIENT_BUFFER_SIZE * 45) / 100;  // 460.8 KB
+
+  char *payload = strdup("large-chunk");  // ~11 bytes
+  pty_buf_t *buf = pty_buf_init(payload, strlen(payload));
+
+  ASSERT_INT_EQ(server->active_client_count, 3, "three clients active");
+  
+  // projected_global = 0 + (11 * 3) = 33 bytes > 20 bytes cap
+  // This should trigger soft-drop for client B (above 50% cap)
+  shared_process_read_cb(process, buf, false);
+
+  // With global cap pressure, client B (above 50% cap) should be soft-dropped
+  ASSERT_PTR_EQ(pss_a.pty_buf, buf, "client A received buffer");
+  ASSERT_TRUE(pss_b.pty_buf == NULL, "client B soft-dropped (above 50% cap)");
+  ASSERT_PTR_EQ(pss_c.pty_buf, buf, "client C received buffer");
+  ASSERT_TRUE(pss_b.soft_dropped_bytes == buf->len, "soft drop bytes tracked for client B");
+  
+  // Global count should only include A and C
+  ASSERT_TRUE(server->global_pending_bytes == buf->len * 2, "global count excludes soft-dropped");
+
+  free_client(&pss_a);
+  free_client(&pss_b);
+  free_client(&pss_c);
+  free_shared_process(process, false);
+  teardown_server();
+  return true;
+}
+
 // ---------------------------------------------------------------------------
 // Test runner
 // ---------------------------------------------------------------------------
@@ -935,6 +982,7 @@ int main(void) {
       {"fixed_geometry_sent_on_handshake", test_fixed_geometry_sent_on_handshake},
       {"client_resize_request_reasserts_geometry", test_client_resize_request_reasserts_geometry},
       {"once_flag_triggers_teardown", test_once_flag_triggers_teardown},
+      {"global_cap_soft_drop", test_global_cap_soft_drop},
   };
 
   size_t passed = 0;

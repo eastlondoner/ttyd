@@ -13,6 +13,7 @@
 
 // Buffer overflow protection - max buffer size per client
 #define MAX_CLIENT_BUFFER_SIZE (1024 * 1024)  // 1MB per client
+#define SOFT_DROP_THRESHOLD (MAX_CLIENT_BUFFER_SIZE * 4 / 10)  // 40% of max (400KB)
 
 // initial message list
 static char initial_cmds[] = {SET_WINDOW_TITLE, SET_PREFERENCES};
@@ -28,6 +29,7 @@ static void shared_client_buffers_init(struct pss_tty *pss) {
   pss->pending_pty_tail = NULL;
   pss->pending_pty_bytes = 0;
   pss->pty_buf = NULL;
+  pss->soft_dropped_bytes = 0;
 }
 
 static void shared_client_buffers_enqueue(struct pss_tty *pss, pty_buf_t *buf) {
@@ -46,21 +48,35 @@ static void shared_client_buffers_enqueue(struct pss_tty *pss, pty_buf_t *buf) {
   pss->pending_pty_tail = node;
   pss->pending_pty_bytes += buf->len;
   pss->pty_buf = pss->pending_pty_head != NULL ? pss->pending_pty_head->buf : NULL;
+  
+  // Update global pending bytes counter (only for non-snapshot_pending clients)
+  if (!pss->snapshot_pending && server != NULL) {
+    server->global_pending_bytes += buf->len;
+  }
 }
 
 static void shared_client_buffers_pop(struct pss_tty *pss) {
   if (pss == NULL || pss->pending_pty_head == NULL) return;
 
   struct pending_shared_buffer *node = pss->pending_pty_head;
+  size_t buf_len = node->buf->len;
+  
   pss->pending_pty_head = node->next;
   if (pss->pending_pty_head == NULL) {
     pss->pending_pty_tail = NULL;
   }
 
-  if (pss->pending_pty_bytes >= node->buf->len) {
-    pss->pending_pty_bytes -= node->buf->len;
+  if (pss->pending_pty_bytes >= buf_len) {
+    pss->pending_pty_bytes -= buf_len;
   } else {
     pss->pending_pty_bytes = 0;
+  }
+
+  // Update global pending bytes counter (guard against underflow)
+  if (server != NULL && server->global_pending_bytes >= buf_len) {
+    server->global_pending_bytes -= buf_len;
+  } else if (server != NULL) {
+    server->global_pending_bytes = 0;
   }
 
   pty_buf_release(node->buf);
@@ -468,6 +484,13 @@ static bool create_shared_process(struct server *server, struct pss_tty *first_p
   lwsl_notice("Shared PTY process created (PID: %d, size: %dx%d)\n",
               process->pid, columns, rows);
 
+  // Initialize global cap if not configured
+  if (server->max_global_pending_bytes == 0) {
+    server->max_global_pending_bytes = 8 * 1024 * 1024;  // 8 MB default
+  }
+  server->global_pending_bytes = 0;
+  lwsl_notice("Global pending bytes cap: %zu bytes\n", server->max_global_pending_bytes);
+
   // Initialize and start snapshot ACK timeout timer
   if (server->snapshot_ack_timeout_ms == 0) {
     server->snapshot_ack_timeout_ms = 10000;  // 10 seconds default if not configured
@@ -513,6 +536,11 @@ static void shared_process_read_cb(pty_process *process, pty_buf_t *buf, bool eo
     lwsl_debug("Fed %zu bytes to libtsm VTE\n", buf_len);
   }
 
+  // Check if we would exceed global cap with this broadcast
+  size_t projected_global = server->global_pending_bytes + (buf_len * (server->active_client_count - skipped_pending));
+  bool global_cap_pressure = projected_global > server->max_global_pending_bytes;
+  int soft_dropped = 0;
+  
   // Broadcast to ALL connected clients using reference counting
   for (int i = 0; i < server->client_wsi_capacity; i++) {
     struct lws *client_wsi = server->client_wsi_list[i];
@@ -542,6 +570,15 @@ static void shared_process_read_cb(pty_process *process, pty_buf_t *buf, bool eo
       continue;  // Skip this client
     }
 
+    // Soft drop: skip clients above soft-drop threshold if global cap pressure
+    if (global_cap_pressure && pending_bytes > SOFT_DROP_THRESHOLD) {
+      soft_dropped++;
+      pss->soft_dropped_bytes += buf_len;
+      lwsl_debug("Soft drop: client %d above threshold (pending=%zu > %zu), skipping %zu bytes\n",
+                 pss->client_index, pending_bytes, SOFT_DROP_THRESHOLD, buf_len);
+      continue;
+    }
+
     // Retain buffer for this client (increments ref_count) even if handshake pending.
     shared_client_buffers_enqueue(pss, buf);
     lws_callback_on_writable(client_wsi);
@@ -554,8 +591,16 @@ static void shared_process_read_cb(pty_process *process, pty_buf_t *buf, bool eo
   // Always resume PTY to maintain continuous read (independent of client drain state)
   pty_resume(server->shared_process);
   
-  lwsl_debug("Broadcast %zu bytes: delivered=%d, skipped_pending=%d, overflow=%d, active=%d, PTY resumed\n", 
-             buf_len, delivered, skipped_pending, disconnected_overflow, server->active_client_count);
+  // Log broadcast results
+  if (global_cap_pressure || soft_dropped > 0) {
+    lwsl_notice("Broadcast %zu bytes: delivered=%d, soft_dropped=%d (global: %zu/%zu bytes), skipped_pending=%d, overflow=%d, active=%d\n",
+                buf_len, delivered, soft_dropped, server->global_pending_bytes, 
+                server->max_global_pending_bytes, skipped_pending, disconnected_overflow, server->active_client_count);
+  } else {
+    lwsl_debug("Broadcast %zu bytes: delivered=%d, skipped_pending=%d, overflow=%d, active=%d, global=%zu/%zu, PTY resumed\n", 
+               buf_len, delivered, skipped_pending, disconnected_overflow, server->active_client_count,
+               server->global_pending_bytes, server->max_global_pending_bytes);
+  }
 
 }
 
@@ -1129,6 +1174,7 @@ int callback_tty(struct lws *wsi, enum lws_callback_reasons reason, void *user, 
       pss->snapshot_pending = false;
       pss->snapshot_sent_at_ms = 0;
       pss->last_activity_at_ms = 0;
+      pss->soft_dropped_bytes = 0;
       shared_client_buffers_init(pss);
 
       if (server->url_arg) {

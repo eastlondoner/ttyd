@@ -74,6 +74,7 @@ struct pss_tty {
   bool snapshot_pending;           // Snapshot sent but not yet acknowledged
   uint64_t snapshot_sent_at_ms;    // Time when SNAPSHOT was sent (for timeout detection)
   uint64_t last_activity_at_ms;    // Last time client sent input or drained output
+  size_t soft_dropped_bytes;       // Cumulative count of bytes soft-dropped for this client
 };
 
 typedef struct {
@@ -125,4 +126,8 @@ struct server {
   uv_timer_t snapshot_timer;         // Single timer for snapshot ACK timeout checks
   uint32_t snapshot_ack_timeout_ms;  // Timeout in milliseconds (default: 10000)
   bool snapshot_timer_active;        // Whether timer has been initialized
+  
+  // NEW: Global memory cap support
+  size_t global_pending_bytes;       // Sum of all clients' pending_pty_bytes (non-pending only)
+  size_t max_global_pending_bytes;   // Global cap (default: 8 MB)
 };
