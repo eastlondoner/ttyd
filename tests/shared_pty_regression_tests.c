@@ -178,6 +178,7 @@ int lws_write(struct lws *wsi, unsigned char *buf, size_t len, enum lws_write_pr
   return (int)len;
 }
 
+__attribute__((weak))
 int uv_write(uv_write_t *req, uv_stream_t *handle, const uv_buf_t bufs[], unsigned int nbufs, uv_write_cb cb) {
   (void)req;
   (void)handle;
@@ -187,11 +188,13 @@ int uv_write(uv_write_t *req, uv_stream_t *handle, const uv_buf_t bufs[], unsign
   return 0;
 }
 
+__attribute__((weak))
 const char *uv_strerror(int err) {
   (void)err;
   return "stub";
 }
 
+__attribute__((weak))
 const char *uv_err_name(int err) {
   (void)err;
   return "stub";
