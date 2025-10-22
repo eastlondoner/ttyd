@@ -52,3 +52,5 @@ build
 
 # Project files
 !init.d
+# SpecStory explanation file
+.specstory/.what-is-this.md
