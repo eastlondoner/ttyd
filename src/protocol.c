@@ -348,10 +348,12 @@ static void snapshot_timeout_cb(uv_timer_t *timer) {
     return;
   }
   
-  // Collect timed-out clients first to avoid modifying list during iteration
-  // Use dynamic allocation to avoid stack overflow with large client capacities
-  struct lws **timed_out = xmalloc(server->client_wsi_capacity * sizeof(struct lws *));
+  // Use a fixed-size stack array for efficiency (covers 99% of cases)
+  // If more timeouts occur, process them in batches
+  #define TIMEOUT_BATCH_SIZE 64
+  struct lws *timed_out[TIMEOUT_BATCH_SIZE];
   int timed_out_count = 0;
+  int total_timed_out = 0;
   
   for (int i = 0; i < server->client_wsi_capacity; i++) {
     if (server->client_wsi_list[i] == NULL) continue;
@@ -364,21 +366,38 @@ static void snapshot_timeout_cb(uv_timer_t *timer) {
       if (elapsed > server->snapshot_ack_timeout_ms) {
         lwsl_warn("Client %d (%s) snapshot ACK timeout (%llu ms), disconnecting\n",
                   pss->client_index, pss->address, (unsigned long long)elapsed);
+        
         timed_out[timed_out_count++] = server->client_wsi_list[i];
+        
+        // If batch is full, process it immediately and continue scanning
+        if (timed_out_count >= TIMEOUT_BATCH_SIZE) {
+          for (int j = 0; j < timed_out_count; j++) {
+            lws_close_reason(timed_out[j], 
+                            LWS_CLOSE_STATUS_POLICY_VIOLATION,
+                            (unsigned char *)"Snapshot ACK timeout", 20);
+            lws_callback_on_writable(timed_out[j]);
+          }
+          total_timed_out += timed_out_count;
+          timed_out_count = 0;
+        }
       }
     }
   }
   
-  // Close all timed-out clients after iteration completes
+  // Close any remaining timed-out clients
   for (int i = 0; i < timed_out_count; i++) {
     lws_close_reason(timed_out[i], 
                     LWS_CLOSE_STATUS_POLICY_VIOLATION,
                     (unsigned char *)"Snapshot ACK timeout", 20);
-    // Nudge close progression
     lws_callback_on_writable(timed_out[i]);
   }
   
-  free(timed_out);
+  total_timed_out += timed_out_count;
+  if (total_timed_out > 0) {
+    lwsl_notice("Disconnected %d client(s) due to snapshot ACK timeout\n", total_timed_out);
+  }
+  
+  #undef TIMEOUT_BATCH_SIZE
 }
 
 // Create shared PTY process (called for first client only)
