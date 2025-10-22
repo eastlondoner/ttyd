@@ -47,7 +47,6 @@ struct pty_process_ {
   uv_async_t async;
   uv_pipe_t *in;
   uv_pipe_t *out;
-  bool paused;
 
   pty_read_cb read_cb;
   pty_exit_cb exit_cb;

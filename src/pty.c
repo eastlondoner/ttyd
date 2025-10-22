@@ -138,13 +138,11 @@ void process_free(pty_process *process) {
 
 void pty_pause(pty_process *process) {
   if (process == NULL) return;
-  if (process->paused) return;
   uv_read_stop((uv_stream_t *) process->out);
 }
 
 void pty_resume(pty_process *process) {
   if (process == NULL) return;
-  if (!process->paused) return;
   process->out->data = process;
   uv_read_start((uv_stream_t *) process->out, alloc_cb, read_cb);
 }
@@ -384,7 +382,6 @@ int pty_spawn(pty_process *process, pty_read_cb read_cb, pty_exit_cb exit_cb) {
 
   process->pid = pi.dwProcessId;
   process->handle = pi.hProcess;
-  process->paused = true;
   process->read_cb = read_cb;
   process->exit_cb = exit_cb;
   process->async.data = process;
@@ -502,7 +499,6 @@ int pty_spawn(pty_process *process, pty_read_cb read_cb, pty_exit_cb exit_cb) {
 
   process->pty = master;
   process->pid = pid;
-  process->paused = true;
   process->read_cb = read_cb;
   process->exit_cb = exit_cb;
   process->async.data = process;

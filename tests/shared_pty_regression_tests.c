@@ -433,7 +433,8 @@ static bool test_shared_read_resumes_after_broadcast(void) {
   ASSERT_INT_EQ(server->active_client_count, 2, "active client count seeded");
   shared_process_read_cb(process, buf1, false);
 
-  ASSERT_INT_EQ(pty_resume_call_count, 0, "pty paused until clients flush");
+  // NEW BEHAVIOR: PTY resumes immediately after broadcast (continuous read)
+  ASSERT_INT_EQ(pty_resume_call_count, 1, "pty resumed immediately after broadcast");
   ASSERT_INT_EQ(writable_call_count, 2, "both clients scheduled writable");
   ASSERT_PTR_EQ(pss_a.pty_buf, buf1, "primary client received buffer");
   ASSERT_PTR_EQ(pss_b.pty_buf, buf1, "secondary client received buffer");
@@ -441,13 +442,13 @@ static bool test_shared_read_resumes_after_broadcast(void) {
 
   int write_rc = callback_tty(pss_a.wsi, LWS_CALLBACK_SERVER_WRITEABLE, &pss_a, NULL, 0);
   ASSERT_INT_EQ(write_rc, 0, "primary client flush handled");
-  ASSERT_INT_EQ(pty_resume_call_count, 0, "pty remains paused until all clients drain");
+  ASSERT_INT_EQ(pty_resume_call_count, 1, "no additional resume from client drain");
   ASSERT_TRUE(pss_a.pty_buf == NULL, "primary client cleared buffer");
   ASSERT_INT_EQ(buf1->ref_count, 1, "buffer still retained by secondary client");
 
   write_rc = callback_tty(pss_b.wsi, LWS_CALLBACK_SERVER_WRITEABLE, &pss_b, NULL, 0);
   ASSERT_INT_EQ(write_rc, 0, "secondary client flush handled");
-  ASSERT_INT_EQ(pty_resume_call_count, 1, "pty resumed after all clients drained");
+  ASSERT_INT_EQ(pty_resume_call_count, 1, "still no additional resume from client drain");
   ASSERT_TRUE(pss_b.pty_buf == NULL, "secondary client cleared buffer");
   ASSERT_INT_EQ(buf_free_count, 1, "buffer released after both clients flush");
 
@@ -455,7 +456,8 @@ static bool test_shared_read_resumes_after_broadcast(void) {
   pty_buf_t *buf2 = pty_buf_init(payload2, strlen(payload2));
 
   shared_process_read_cb(process, buf2, false);
-  ASSERT_INT_EQ(pty_resume_call_count, 1, "pty paused until second flush");
+  // Second broadcast causes second immediate resume
+  ASSERT_INT_EQ(pty_resume_call_count, 2, "pty resumed immediately after second broadcast");
   ASSERT_INT_EQ(writable_call_count, 4, "both clients received second writable");
   ASSERT_PTR_EQ(pss_a.pty_buf, buf2, "primary received second buffer");
   ASSERT_PTR_EQ(pss_b.pty_buf, buf2, "secondary received second buffer");
@@ -463,18 +465,41 @@ static bool test_shared_read_resumes_after_broadcast(void) {
 
   write_rc = callback_tty(pss_a.wsi, LWS_CALLBACK_SERVER_WRITEABLE, &pss_a, NULL, 0);
   ASSERT_INT_EQ(write_rc, 0, "primary client flushed second buffer");
-  ASSERT_INT_EQ(pty_resume_call_count, 1, "pty still paused until second client drains");
+  ASSERT_INT_EQ(pty_resume_call_count, 2, "no additional resume from client drain");
   ASSERT_TRUE(pss_a.pty_buf == NULL, "primary cleared second buffer");
   ASSERT_INT_EQ(buf2->ref_count, 1, "second buffer retained by secondary");
 
   write_rc = callback_tty(pss_b.wsi, LWS_CALLBACK_SERVER_WRITEABLE, &pss_b, NULL, 0);
   ASSERT_INT_EQ(write_rc, 0, "secondary client flushed second buffer");
-  ASSERT_INT_EQ(pty_resume_call_count, 2, "pty resumed after secondary drained second buffer");
+  ASSERT_INT_EQ(pty_resume_call_count, 2, "still no additional resume from client drain");
   ASSERT_TRUE(pss_b.pty_buf == NULL, "secondary cleared second buffer");
   ASSERT_INT_EQ(buf_free_count, 2, "second buffer released after both clients flush");
 
   free_client(&pss_a);
   free_client(&pss_b);
+  free_shared_process(process, false);
+  teardown_server();
+  return true;
+}
+
+static bool test_shared_read_resumes_without_clients(void) {
+  reset_stub_state();
+  init_server(1);
+
+  pty_ctx_t *ctx = NULL;
+  pty_process *process = make_shared_process(server, &ctx);
+  (void)ctx;
+
+  char *payload = strdup("orphaned-chunk");
+  pty_buf_t *buf = pty_buf_init(payload, strlen(payload));
+
+  ASSERT_INT_EQ(server->active_client_count, 0, "no clients connected");
+  shared_process_read_cb(process, buf, false);
+
+  ASSERT_INT_EQ(writable_call_count, 0, "no writable callbacks queued without clients");
+  ASSERT_INT_EQ(buf_free_count, 1, "buffer freed when no clients consume it");
+  ASSERT_INT_EQ(pty_resume_call_count, 1, "pty resumed immediately with no clients");
+
   free_shared_process(process, false);
   teardown_server();
   return true;
@@ -540,7 +565,8 @@ static bool test_shared_resume_on_close_when_last_buffer_dropped(void) {
   ASSERT_INT_EQ(result, 0, "closed callback succeeds");
   ASSERT_TRUE(pss.pty_buf == NULL, "pending buffer cleared on close");
   ASSERT_INT_EQ(buf_free_count, 1, "buffer freed when final reference dropped");
-  ASSERT_INT_EQ(pty_resume_call_count, 1, "pty resumed after last buffer released on close");
+  // NEW BEHAVIOR: PTY is continuously reading, no resume from close needed
+  ASSERT_INT_EQ(pty_resume_call_count, 0, "no resume from close (continuous read mode)");
 
   free_client(&pss);
   free_shared_process(process, false);
@@ -617,7 +643,8 @@ static bool test_initial_output_flushed_after_snapshot_ack(void) {
               "expected payload delivered");
   ASSERT_TRUE(pss.pty_buf == NULL, "buffer cleared after flush");
   ASSERT_INT_EQ(buf_free_count, 1, "buffer freed after flush");
-  ASSERT_INT_EQ(pty_resume_call_count, 1, "pty resumed after buffer drained");
+  // NEW BEHAVIOR: PTY resumed immediately after broadcast (line 599), not after drain
+  ASSERT_INT_EQ(pty_resume_call_count, 1, "pty resumed after broadcast (continuous read)");
 
   free_client(&pss);
   free_shared_process(process, false);
@@ -894,6 +921,7 @@ int main(void) {
     bool (*fn)(void);
   } tests[] = {
       {"shared_read_resumes_after_broadcast", test_shared_read_resumes_after_broadcast},
+      {"shared_read_resumes_without_clients", test_shared_read_resumes_without_clients},
       {"shared_buffer_released_on_close", test_shared_buffer_released_on_close},
       {"shared_resume_on_close_when_last_buffer_dropped", test_shared_resume_on_close_when_last_buffer_dropped},
       {"initial_output_flushed_after_snapshot_ack", test_initial_output_flushed_after_snapshot_ack},

@@ -264,6 +264,15 @@ static void server_free(struct server *ts) {
     ts->tsm_screen = NULL;
   }
 
+  // Stop and close snapshot timer (defensive - may already be closed)
+  if (ts->shared_pty_mode && ts->snapshot_timer_active) {
+    uv_timer_stop(&ts->snapshot_timer);
+    if (!uv_is_closing((uv_handle_t *)&ts->snapshot_timer)) {
+      uv_close((uv_handle_t *)&ts->snapshot_timer, NULL);
+    }
+    ts->snapshot_timer_active = false;
+  }
+
   uv_loop_close(ts->loop);
 
   free(ts->loop);

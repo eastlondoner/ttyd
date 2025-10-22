@@ -72,6 +72,8 @@ struct pss_tty {
   bool pending_session_resize; // Whether we owe the client a session resize frame
   bool resize_sent;                // Track if initial resize was sent during handshake
   bool snapshot_pending;           // Snapshot sent but not yet acknowledged
+  uint64_t snapshot_sent_at_ms;    // Time when SNAPSHOT was sent (for timeout detection)
+  uint64_t last_activity_at_ms;    // Last time client sent input or drained output
 };
 
 typedef struct {
@@ -118,4 +120,9 @@ struct server {
   struct tsm_screen *tsm_screen;  // Terminal screen state machine
   struct tsm_vte *tsm_vte;        // VT100 emulator
   int scrollback_size;            // Scrollback buffer size (default: 2000)
+  
+  // NEW: Snapshot ACK timeout support
+  uv_timer_t snapshot_timer;         // Single timer for snapshot ACK timeout checks
+  uint32_t snapshot_ack_timeout_ms;  // Timeout in milliseconds (default: 10000)
+  bool snapshot_timer_active;        // Whether timer has been initialized
 };

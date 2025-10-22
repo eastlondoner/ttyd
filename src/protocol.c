@@ -325,6 +325,7 @@ done:
 // NEW: Shared mode callbacks and functions
 static void shared_process_read_cb(pty_process *process, pty_buf_t *buf, bool eof);
 static void shared_process_exit_cb(pty_process *process);
+static void snapshot_timeout_cb(uv_timer_t *timer);
 static char **build_args_from_server(struct server *server);
 static char **build_env_from_server(struct server *server);
 
@@ -336,6 +337,41 @@ static void tsm_write_cb(struct tsm_vte *vte, const char *u8, size_t len, void *
 static bool init_tsm_screen(struct server *server, uint16_t columns, uint16_t rows);
 static void cleanup_tsm_screen(struct server *server);
 static char *serialize_snapshot(struct server *server, uint16_t cols, uint16_t rows);
+
+// Timer callback to check for snapshot ACK timeouts
+static void snapshot_timeout_cb(uv_timer_t *timer) {
+  struct server *server = timer->data;
+  uint64_t now = uv_now(server->loop);
+  
+  // Collect timed-out clients first to avoid modifying list during iteration
+  struct lws *timed_out[server->client_wsi_capacity];
+  int timed_out_count = 0;
+  
+  for (int i = 0; i < server->client_wsi_capacity; i++) {
+    if (server->client_wsi_list[i] == NULL) continue;
+    
+    struct pss_tty *pss = get_pss_from_wsi(server->client_wsi_list[i]);
+    if (pss == NULL) continue;
+    
+    if (pss->snapshot_pending) {
+      uint64_t elapsed = now - pss->snapshot_sent_at_ms;
+      if (elapsed > server->snapshot_ack_timeout_ms) {
+        lwsl_warn("Client %d (%s) snapshot ACK timeout (%llu ms), disconnecting\n",
+                  pss->client_index, pss->address, (unsigned long long)elapsed);
+        timed_out[timed_out_count++] = server->client_wsi_list[i];
+      }
+    }
+  }
+  
+  // Close all timed-out clients after iteration completes
+  for (int i = 0; i < timed_out_count; i++) {
+    lws_close_reason(timed_out[i], 
+                    LWS_CLOSE_STATUS_POLICY_VIOLATION,
+                    (unsigned char *)"Snapshot ACK timeout", 20);
+    // Nudge close progression
+    lws_callback_on_writable(timed_out[i]);
+  }
+}
 
 // Create shared PTY process (called for first client only)
 static bool create_shared_process(struct server *server, struct pss_tty *first_pss) {
@@ -404,6 +440,14 @@ static bool create_shared_process(struct server *server, struct pss_tty *first_p
   lwsl_notice("Shared PTY process created (PID: %d, size: %dx%d)\n",
               process->pid, columns, rows);
 
+  // Initialize and start snapshot ACK timeout timer
+  server->snapshot_ack_timeout_ms = 10000;  // 10 seconds default
+  uv_timer_init(server->loop, &server->snapshot_timer);
+  server->snapshot_timer.data = server;
+  uv_timer_start(&server->snapshot_timer, snapshot_timeout_cb, 1000, 1000);  // Check every 1 second
+  server->snapshot_timer_active = true;
+  lwsl_notice("Snapshot ACK timeout timer started (timeout: %u ms)\n", server->snapshot_ack_timeout_ms);
+
   // Resume the shared PTY process to start reading output
   pty_resume(process);
 
@@ -423,6 +467,8 @@ static void shared_process_read_cb(pty_process *process, pty_buf_t *buf, bool eo
 
   size_t buf_len = buf->len;
   int delivered = 0;
+  int skipped_pending = 0;
+  int disconnected_overflow = 0;
 
   // Check for buffer overflow protection
   if (buf_len > MAX_CLIENT_BUFFER_SIZE) {
@@ -445,11 +491,19 @@ static void shared_process_read_cb(pty_process *process, pty_buf_t *buf, bool eo
     struct pss_tty *pss = get_pss_from_wsi(client_wsi);
     if (pss == NULL) continue;
 
+    // Skip enqueuing to clients waiting for snapshot ACK
+    if (pss->snapshot_pending) {
+      skipped_pending++;
+      lwsl_debug("Skipping enqueue to client %d - snapshot pending\n", pss->client_index);
+      continue;
+    }
+
     size_t pending_bytes = pss->pending_pty_bytes;
     size_t projected_bytes = pending_bytes + buf_len;
 
     // Check if this client already has too much buffered data queued
     if (pending_bytes > MAX_CLIENT_BUFFER_SIZE / 2 || projected_bytes > MAX_CLIENT_BUFFER_SIZE) {
+      disconnected_overflow++;
       lwsl_warn("Client %d buffer overflow (pending=%zu, incoming=%zu), disconnecting\n",
                 pss->client_index, pending_bytes, buf_len);
       shared_client_buffers_clear(pss);
@@ -466,7 +520,12 @@ static void shared_process_read_cb(pty_process *process, pty_buf_t *buf, bool eo
 
   // Release the original reference (buffer will be freed when all clients finish)
   pty_buf_release(buf);
-  lwsl_debug("Broadcast %zu bytes to %d clients\n", buf_len, delivered);
+  
+  // Always resume PTY to maintain continuous read (independent of client drain state)
+  pty_resume(server->shared_process);
+  
+  lwsl_debug("Broadcast %zu bytes: delivered=%d, skipped_pending=%d, overflow=%d, active=%d, PTY resumed\n", 
+             buf_len, delivered, skipped_pending, disconnected_overflow, server->active_client_count);
 
 }
 
@@ -513,6 +572,14 @@ static void shared_process_exit_cb(pty_process *process) {
 
   // Clean up libtsm screen and VTE
   cleanup_tsm_screen(server);
+
+  // Stop and close snapshot timer
+  if (server->snapshot_timer_active) {
+    uv_timer_stop(&server->snapshot_timer);
+    uv_close((uv_handle_t *)&server->snapshot_timer, NULL);
+    server->snapshot_timer_active = false;
+    lwsl_notice("Snapshot timer stopped and closed\n");
+  }
 
   // Clean up shared process
   server->shared_process = NULL;  // Clear before freeing to prevent race
@@ -1098,6 +1165,7 @@ int callback_tty(struct lws *wsi, enum lws_callback_reasons reason, void *user, 
 
             // Mark snapshot as pending - block PTY output until acknowledged
             pss->snapshot_pending = true;
+            pss->snapshot_sent_at_ms = server->loop ? uv_now(server->loop) : 0;
             lwsl_notice("Sent snapshot to client %s (%d bytes), blocking PTY output\n", pss->address, (int)json_len);
           }
         }
@@ -1158,11 +1226,8 @@ int callback_tty(struct lws *wsi, enum lws_callback_reasons reason, void *user, 
         // Resume PTY to continue reading
         if (!server->shared_pty_mode && pss->process != NULL) {
           pty_resume(pss->process);
-        } else if (server->shared_pty_mode) {
-          if (!shared_session_has_pending_buffers(server) && server->shared_process != NULL) {
-            pty_resume(server->shared_process);
-          }
         }
+        // In shared mode, PTY is continuously resumed in shared_process_read_cb
       }
       break;
 
@@ -1351,11 +1416,8 @@ int callback_tty(struct lws *wsi, enum lws_callback_reasons reason, void *user, 
           pss->pending_pty_bytes = 0;
         }
 
-        // If this was the last pending buffer in shared mode, resume the PTY
-        if (server->shared_process != NULL &&
-            !shared_session_has_pending_buffers(server)) {
-          pty_resume(server->shared_process);
-        }
+        // In shared mode, PTY is continuously resumed in shared_process_read_cb
+        // No need to resume here
       } else if (pss->pty_buf != NULL) {
         pty_buf_free(pss->pty_buf);
         pss->pty_buf = NULL;
