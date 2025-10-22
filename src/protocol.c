@@ -364,8 +364,9 @@ static void snapshot_timeout_cb(uv_timer_t *timer) {
     if (pss->snapshot_pending) {
       uint64_t elapsed = now - pss->snapshot_sent_at_ms;
       if (elapsed > server->snapshot_ack_timeout_ms) {
-        lwsl_warn("Client %d (%s) snapshot ACK timeout (%llu ms), disconnecting\n",
-                  pss->client_index, pss->address, (unsigned long long)elapsed);
+        uint64_t idle_ms = pss->last_activity_at_ms > 0 ? now - pss->last_activity_at_ms : elapsed;
+        lwsl_warn("Client %d (%s) snapshot ACK timeout (%llu ms), idle for %llu ms, disconnecting\n",
+                  pss->client_index, pss->address, (unsigned long long)elapsed, (unsigned long long)idle_ms);
         
         timed_out[timed_out_count++] = server->client_wsi_list[i];
         
@@ -468,7 +469,9 @@ static bool create_shared_process(struct server *server, struct pss_tty *first_p
               process->pid, columns, rows);
 
   // Initialize and start snapshot ACK timeout timer
-  server->snapshot_ack_timeout_ms = 10000;  // 10 seconds default
+  if (server->snapshot_ack_timeout_ms == 0) {
+    server->snapshot_ack_timeout_ms = 10000;  // 10 seconds default if not configured
+  }
   uv_timer_init(server->loop, &server->snapshot_timer);
   server->snapshot_timer.data = server;
   uv_timer_start(&server->snapshot_timer, snapshot_timeout_cb, 1000, 1000);  // Check every 1 second
@@ -1124,6 +1127,8 @@ int callback_tty(struct lws *wsi, enum lws_callback_reasons reason, void *user, 
       pss->pending_session_resize = false;
       pss->resize_sent = false;
       pss->snapshot_pending = false;
+      pss->snapshot_sent_at_ms = 0;
+      pss->last_activity_at_ms = 0;
       shared_client_buffers_init(pss);
 
       if (server->url_arg) {
@@ -1245,6 +1250,11 @@ int callback_tty(struct lws *wsi, enum lws_callback_reasons reason, void *user, 
 
         wsi_output(wsi, pss->pty_buf);
 
+        // Update activity timestamp on successful output
+        if (server->shared_pty_mode && server->loop) {
+          pss->last_activity_at_ms = uv_now(server->loop);
+        }
+
         // Use reference counting in shared mode, direct free in non-shared mode
         if (server->shared_pty_mode) {
           shared_client_buffers_pop(pss);
@@ -1304,6 +1314,7 @@ int callback_tty(struct lws *wsi, enum lws_callback_reasons reason, void *user, 
                 lwsl_err("uv_write to shared process: %s (%s)\n", uv_err_name(err), uv_strerror(err));
                 return -1;
               }
+              pss->last_activity_at_ms = server->loop ? uv_now(server->loop) : 0;
             } else {
               lwsl_warn("No shared process available for input\n");
             }
@@ -1349,6 +1360,7 @@ int callback_tty(struct lws *wsi, enum lws_callback_reasons reason, void *user, 
           // Client has finished applying snapshot, unblock PTY output
           if (server->shared_pty_mode && pss->snapshot_pending) {
             pss->snapshot_pending = false;
+            pss->last_activity_at_ms = server->loop ? uv_now(server->loop) : 0;
             lwsl_notice("Snapshot acknowledged by client %s, unblocking PTY output\n", pss->address);
             // Trigger writable callback to flush any pending PTY output
             if (pss->pty_buf != NULL) {

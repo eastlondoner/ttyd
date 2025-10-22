@@ -83,12 +83,13 @@ static const struct option options[] = {{"port", required_argument, NULL, 'p'},
                                         {"shared-pty", no_argument, NULL, 'Q'},
                                         {"session-width", required_argument, NULL, 'X'},
                                         {"session-height", required_argument, NULL, 'Y'},
+                                        {"snapshot-ack-timeout", required_argument, NULL, 'Z'},
                                         {"browser", no_argument, NULL, 'B'},
                                         {"debug", required_argument, NULL, 'd'},
                                         {"version", no_argument, NULL, 'v'},
                                         {"help", no_argument, NULL, 'h'},
                                         {NULL, 0, 0, 0}};
-static const char *opt_string = "p:i:U:c:H:u:g:s:w:I:b:P:f:6aSC:K:A:Wt:T:Om:oqQX:Y:Bd:vh";
+static const char *opt_string = "p:i:U:c:H:u:g:s:w:I:b:P:f:6aSC:K:A:Wt:T:Om:oqQX:Y:Z:Bd:vh";
 
 static void print_help() {
   // clang-format off
@@ -118,6 +119,7 @@ static void print_help() {
           "    -Q, --shared-pty        Enable shared PTY mode (all clients share one terminal)\n"
           "    -X, --session-width     Fixed terminal width in columns (default: 120)\n"
           "    -Y, --session-height    Fixed terminal height in rows (default: 32)\n"
+          "    -Z, --snapshot-ack-timeout  Snapshot ACK timeout in milliseconds (default: 10000)\n"
           "    -B, --browser           Open terminal with the default system browser\n"
           "    -I, --index             Custom index.html path\n"
           "    -b, --base-path         Expected base path for requests coming from a reverse proxy (eg: /mounted/here, max length: 128)\n"
@@ -443,6 +445,14 @@ int main(int argc, char **argv) {
           return -1;
         }
         server->session_rows = (uint16_t)rows;
+      } break;
+      case 'Z': {
+        int timeout = parse_int("snapshot-ack-timeout", optarg);
+        if (timeout < 0) {
+          fprintf(stderr, "ttyd: invalid snapshot ACK timeout: %s\n", optarg);
+          return -1;
+        }
+        server->snapshot_ack_timeout_ms = (uint32_t)timeout;
       } break;
       case 'B':
         browser = true;
