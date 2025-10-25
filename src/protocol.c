@@ -512,6 +512,10 @@ static bool create_shared_process(struct server *server, struct pss_tty *first_p
   // Resume the shared PTY process to start reading output
   pty_resume(process);
 
+  // Reset CPR interception state
+  server->cpr_hold_len = 0;
+  server->cpr_state = 0;
+
   return true;
 }
 
@@ -542,6 +546,145 @@ static void shared_process_read_cb(pty_process *process, pty_buf_t *buf, bool eo
   if (server->tsm_vte != NULL && buf->base != NULL && buf_len > 0) {
     tsm_vte_input(server->tsm_vte, buf->base, buf_len);
     lwsl_debug("Fed %zu bytes to libtsm VTE\n", buf_len);
+  }
+
+  // Stateful CSI 6n (CPR) interception across reads when clients are attached
+  if (server->active_client_count > 0 && buf->base != NULL && buf_len > 0) {
+    const unsigned char *src = (const unsigned char *)buf->base;
+    unsigned char *dst = (unsigned char *)buf->base;
+    size_t i = 0, o = 0;
+
+    while (i < buf_len) {
+      unsigned char b = src[i];
+      bool consumed = false;
+
+      switch (server->cpr_state) {
+        case 0: // idle
+          if (b == 0x1B) { // ESC
+            server->cpr_hold_len = 0;
+            server->cpr_hold[server->cpr_hold_len++] = b;
+            server->cpr_state = 1; // seen ESC
+            consumed = true;
+          } else if (b == 0x9B) { // 8-bit CSI
+            server->cpr_hold_len = 0;
+            server->cpr_hold[server->cpr_hold_len++] = b;
+            server->cpr_state = 2; // CSI start
+            consumed = true;
+          }
+          break;
+        case 1: // ESC seen, expect '['
+          if (b == '[') {
+            server->cpr_hold[server->cpr_hold_len++] = b;
+            server->cpr_state = 2; // CSI start
+            consumed = true;
+          } else {
+            // Not a CSI; flush hold and current byte
+            for (size_t k = 0; k < server->cpr_hold_len; k++) dst[o++] = server->cpr_hold[k];
+            server->cpr_hold_len = 0;
+            server->cpr_state = 0;
+          }
+          break;
+        case 2: // CSI start, optional '?'
+          if (b == '?') {
+            server->cpr_hold[server->cpr_hold_len++] = b;
+            server->cpr_state = 3;
+            consumed = true;
+          } else if (b == '6') {
+            server->cpr_hold[server->cpr_hold_len++] = b;
+            server->cpr_state = 4; // seen '6', expect 'n'
+            consumed = true;
+          } else {
+            // Not a CPR request; flush hold
+            for (size_t k = 0; k < server->cpr_hold_len; k++) dst[o++] = server->cpr_hold[k];
+            server->cpr_hold_len = 0;
+            server->cpr_state = 0;
+          }
+          break;
+        case 3: // CSI + '?', expect '6'
+          if (b == '6') {
+            server->cpr_hold[server->cpr_hold_len++] = b;
+            server->cpr_state = 4;
+            consumed = true;
+          } else {
+            for (size_t k = 0; k < server->cpr_hold_len; k++) dst[o++] = server->cpr_hold[k];
+            server->cpr_hold_len = 0;
+            server->cpr_state = 0;
+          }
+          break;
+        case 4: // CSI + (optional '?') + '6' seen, expect 'n' to complete request
+          if (b == 'n') {
+            // Complete CSI 6n request: synthesize CPR reply and suppress request
+            unsigned int cx = 1, cy = 1;
+            if (server->tsm_screen != NULL) {
+              cx = tsm_screen_get_cursor_x(server->tsm_screen) + 1;
+              cy = tsm_screen_get_cursor_y(server->tsm_screen) + 1;
+            }
+            char reply[32];
+            int rlen = snprintf(reply, sizeof(reply), "\x1b[%u;%uR", cy, cx);
+            if (rlen > 0 && rlen < (int)sizeof(reply) && server->shared_process != NULL) {
+              lwsl_debug("Intercepted CSI 6n, replying with ESC[%u;%uR and suppressing broadcast\n", cy, cx);
+              pty_write(server->shared_process, pty_buf_init(reply, (size_t)rlen));
+            }
+            // Reset state; do not copy the sequence
+            server->cpr_hold_len = 0;
+            server->cpr_state = 0;
+            consumed = true;
+          } else {
+            // Not 'n'; flush hold
+            for (size_t k = 0; k < server->cpr_hold_len; k++) dst[o++] = server->cpr_hold[k];
+            server->cpr_hold_len = 0;
+            server->cpr_state = 0;
+          }
+          break;
+      }
+
+      if (!consumed) {
+        // Try to suppress CPR responses in the same buffer: ESC[digits;digitsR or 0x9B...R
+        if (b == 0x1B && (i + 1) < buf_len && src[i + 1] == '[') {
+          size_t j = i + 2, d1 = j;
+          while (j < buf_len && src[j] >= '0' && src[j] <= '9') j++;
+          if (j > d1 && j < buf_len && src[j] == ';') {
+            j++;
+            size_t d2 = j;
+            while (j < buf_len && src[j] >= '0' && src[j] <= '9') j++;
+            if (j > d2 && j < buf_len && src[j] == 'R') {
+              lwsl_debug("Suppressing echoed CPR response from broadcast\n");
+              i = j + 1;
+              continue;
+            }
+          }
+        } else if (b == 0x9B) {
+          size_t j = i + 1, d1 = j;
+          while (j < buf_len && src[j] >= '0' && src[j] <= '9') j++;
+          if (j > d1 && j < buf_len && src[j] == ';') {
+            j++;
+            size_t d2 = j;
+            while (j < buf_len && src[j] >= '0' && src[j] <= '9') j++;
+            if (j > d2 && j < buf_len && src[j] == 'R') {
+              lwsl_debug("Suppressing echoed CPR response from broadcast (8-bit)\n");
+              i = j + 1;
+              continue;
+            }
+          }
+        }
+
+        // Default copy path
+        dst[o++] = b;
+        i++;
+      } else {
+        // consumed by state machine; advance input index
+        i++;
+      }
+    }
+
+    // Update buffer length after filtering
+    buf->len = o;
+    buf_len = o;
+
+    if (buf_len == 0) {
+      pty_buf_free(buf);
+      return;
+    }
   }
 
   int soft_dropped = 0;
