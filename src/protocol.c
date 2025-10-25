@@ -809,27 +809,63 @@ static void tsm_log_cb(void *data, const char *file, int line, const char *fn,
   }
 }
 
+// Heuristic: does 'u8' look like a CPR (Cursor Position Report) response: ESC[row;colR or CSI row;col R
+static bool looks_like_cpr_response(const char *u8, size_t len) {
+  if (u8 == NULL || len < 4) return false;
+
+  size_t i = 0;
+  if ((unsigned char)u8[0] == 0x1b) {
+    if (len < 3 || u8[1] != '[') return false;
+    i = 2;
+  } else if ((unsigned char)u8[0] == 0x9b) {
+    i = 1;
+  } else {
+    return false;
+  }
+
+  // Optional '?'
+  if (i < len && u8[i] == '?') i++;
+
+  // row digits
+  size_t start_row = i;
+  while (i < len && u8[i] >= '0' && u8[i] <= '9') i++;
+  if (i == start_row) return false;
+
+  // semicolon
+  if (i >= len || u8[i] != ';') return false;
+  i++;
+
+  // col digits
+  size_t start_col = i;
+  while (i < len && u8[i] >= '0' && u8[i] <= '9') i++;
+  if (i == start_col) return false;
+
+  // trailing 'R' and no extra junk
+  if (i >= len || u8[i] != 'R') return false;
+  return (i == len - 1);
+}
+
 // libtsm write callback - sends data back to PTY (e.g., for responses to queries)
 static void tsm_write_cb(struct tsm_vte *vte, const char *u8, size_t len, void *data) {
   struct server *server = (struct server *)data;
-  
-  // Only respond to terminal queries when NO clients are attached.
-  // This prevents TUI apps (like cursor) from timing out when they send cursor position
-  // queries (CSI 6n) before any web client has connected to provide a terminal emulator.
-  //
-  // When clients ARE attached, xterm.js in the browser handles all terminal queries,
-  // so we don't respond here to avoid:
-  // 1. Double responses (both libtsm and xterm.js responding)
-  // 2. Broadcasting escape sequences to all clients
-  if (server->active_client_count == 0 && server->shared_process != NULL) {
-    lwsl_debug("libtsm auto-responding to terminal query (%zu bytes) - no clients attached\n", len);
+
+  bool is_cpr = looks_like_cpr_response(u8, len);
+
+  // Fast-path CPR responses even when a client is attached to avoid latency-induced timeouts.
+  // Otherwise, only respond when NO clients are attached.
+  if (server->shared_process != NULL && (is_cpr || server->active_client_count == 0)) {
+    if (is_cpr && server->active_client_count > 0) {
+      lwsl_debug("libtsm fast-path CPR response (%zu bytes) with clients attached\n", len);
+    } else if (server->active_client_count == 0) {
+      lwsl_debug("libtsm auto-responding to terminal query (%zu bytes) - no clients attached\n", len);
+    }
     pty_buf_t *response = pty_buf_init((char *)u8, len);
     int err = pty_write(server->shared_process, response);
     if (err) {
       lwsl_warn("Failed to write VTE response to PTY: %s (%s)\n", uv_err_name(err), uv_strerror(err));
     }
   }
-  
+
   (void)vte;  // Suppress unused parameter warning
 }
 
