@@ -1107,6 +1107,141 @@ static bool test_cpr_response_suppressed_from_broadcast(void) {
   return true;
 }
 
+static bool test_esc_non_bracket_passthrough(void) {
+  reset_stub_state();
+  init_server(1);
+
+  struct pss_tty pss;
+  make_client(&pss, 0, true);
+
+  pty_ctx_t *ctx = NULL;
+  pty_process *process = make_shared_process(server, &ctx);
+  server->shared_process = process;
+  ASSERT_TRUE(init_tsm_screen(server, 80, 24), "tsm screen initialized");
+
+  // Input: ESC 'X' 'Z' should pass through unchanged
+  char *payload = malloc(3);
+  payload[0] = '\x1b';
+  payload[1] = 'X';
+  payload[2] = 'Z';
+  pty_buf_t *buf = pty_buf_init(payload, 3);
+
+  shared_process_read_cb(process, buf, false);
+
+  ASSERT_PTR_EQ(pss.pty_buf, buf, "client received buffer");
+  ASSERT_INT_EQ((int)pss.pty_buf->len, 3, "length preserved");
+  ASSERT_TRUE(pss.pty_buf->base[0] == '\x1b' && pss.pty_buf->base[1] == 'X' && pss.pty_buf->base[2] == 'Z',
+              "bytes preserved");
+
+  free_client(&pss);
+  free_shared_process(process, false);
+  cleanup_tsm_screen(server);
+  teardown_server();
+  return true;
+}
+
+static bool test_csi_non_question_or_6_passthrough(void) {
+  reset_stub_state();
+  init_server(1);
+
+  struct pss_tty pss;
+  make_client(&pss, 0, true);
+
+  pty_ctx_t *ctx = NULL;
+  pty_process *process = make_shared_process(server, &ctx);
+  server->shared_process = process;
+  ASSERT_TRUE(init_tsm_screen(server, 80, 24), "tsm screen initialized");
+
+  // Input: ESC '[' 'A' 'B' should pass through
+  char *payload = malloc(4);
+  payload[0] = '\x1b';
+  payload[1] = '[';
+  payload[2] = 'A';
+  payload[3] = 'B';
+  pty_buf_t *buf = pty_buf_init(payload, 4);
+
+  shared_process_read_cb(process, buf, false);
+
+  ASSERT_PTR_EQ(pss.pty_buf, buf, "client received buffer");
+  ASSERT_INT_EQ((int)pss.pty_buf->len, 4, "length preserved");
+  ASSERT_TRUE(pss.pty_buf->base[0] == '\x1b' && pss.pty_buf->base[1] == '[' &&
+              pss.pty_buf->base[2] == 'A' && pss.pty_buf->base[3] == 'B', "bytes preserved");
+
+  free_client(&pss);
+  free_shared_process(process, false);
+  cleanup_tsm_screen(server);
+  teardown_server();
+  return true;
+}
+
+static bool test_csi_question_non_6_passthrough(void) {
+  reset_stub_state();
+  init_server(1);
+
+  struct pss_tty pss;
+  make_client(&pss, 0, true);
+
+  pty_ctx_t *ctx = NULL;
+  pty_process *process = make_shared_process(server, &ctx);
+  server->shared_process = process;
+  ASSERT_TRUE(init_tsm_screen(server, 80, 24), "tsm screen initialized");
+
+  // Input: ESC '[' '?' 'A' should pass through
+  char *payload = malloc(4);
+  payload[0] = '\x1b';
+  payload[1] = '[';
+  payload[2] = '?';
+  payload[3] = 'A';
+  pty_buf_t *buf = pty_buf_init(payload, 4);
+
+  shared_process_read_cb(process, buf, false);
+
+  ASSERT_PTR_EQ(pss.pty_buf, buf, "client received buffer");
+  ASSERT_INT_EQ((int)pss.pty_buf->len, 4, "length preserved");
+  ASSERT_TRUE(pss.pty_buf->base[0] == '\x1b' && pss.pty_buf->base[1] == '[' &&
+              pss.pty_buf->base[2] == '?' && pss.pty_buf->base[3] == 'A', "bytes preserved");
+
+  free_client(&pss);
+  free_shared_process(process, false);
+  cleanup_tsm_screen(server);
+  teardown_server();
+  return true;
+}
+
+static bool test_csi_6_non_n_passthrough(void) {
+  reset_stub_state();
+  init_server(1);
+
+  struct pss_tty pss;
+  make_client(&pss, 0, true);
+
+  pty_ctx_t *ctx = NULL;
+  pty_process *process = make_shared_process(server, &ctx);
+  server->shared_process = process;
+  ASSERT_TRUE(init_tsm_screen(server, 80, 24), "tsm screen initialized");
+
+  // Input: ESC '[' '6' 'A' should pass through
+  char *payload = malloc(4);
+  payload[0] = '\x1b';
+  payload[1] = '[';
+  payload[2] = '6';
+  payload[3] = 'A';
+  pty_buf_t *buf = pty_buf_init(payload, 4);
+
+  shared_process_read_cb(process, buf, false);
+
+  ASSERT_PTR_EQ(pss.pty_buf, buf, "client received buffer");
+  ASSERT_INT_EQ((int)pss.pty_buf->len, 4, "length preserved");
+  ASSERT_TRUE(pss.pty_buf->base[0] == '\x1b' && pss.pty_buf->base[1] == '[' &&
+              pss.pty_buf->base[2] == '6' && pss.pty_buf->base[3] == 'A', "bytes preserved");
+
+  free_client(&pss);
+  free_shared_process(process, false);
+  cleanup_tsm_screen(server);
+  teardown_server();
+  return true;
+}
+
 // ---------------------------------------------------------------------------
 // Test runner
 // ---------------------------------------------------------------------------
@@ -1132,6 +1267,10 @@ int main(void) {
       {"cpr_request_inline_intercepted", test_cpr_request_inline_intercepted},
       {"cpr_request_split_over_buffers_intercepted", test_cpr_request_split_over_buffers_intercepted},
       {"cpr_response_suppressed_from_broadcast", test_cpr_response_suppressed_from_broadcast},
+      {"esc_non_bracket_passthrough", test_esc_non_bracket_passthrough},
+      {"csi_non_question_or_6_passthrough", test_csi_non_question_or_6_passthrough},
+      {"csi_question_non_6_passthrough", test_csi_question_non_6_passthrough},
+      {"csi_6_non_n_passthrough", test_csi_6_non_n_passthrough},
   };
 
   size_t passed = 0;
