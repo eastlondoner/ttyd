@@ -132,7 +132,7 @@ struct server {
   size_t max_global_pending_bytes;   // Global cap (default: 8 MB)
 
   // Stateful CPR (CSI 6n) interception across PTY reads (shared PTY mode)
-  unsigned char cpr_hold[4];         // Buffer for partial CSI introducer and tokens
+  unsigned char cpr_hold[8];         // Buffer for partial CSI introducer and tokens (ESC, '[', '?', '6', 'n')
   size_t cpr_hold_len;               // Number of bytes in cpr_hold
   unsigned char cpr_state;           // 0=none, 1=ESC, 2=CSI, 3=CSI+?, 4=CSI+6 (waiting 'n')
 };

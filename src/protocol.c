@@ -637,7 +637,13 @@ static void shared_process_read_cb(pty_process *process, pty_buf_t *buf, bool eo
             server->cpr_state = 2; // CSI start
             consumed = true;
           } else {
-            // Should have been handled by pre-flush; treat as normal byte
+            // Not a CSI sequence: flush held ESC and copy current byte
+            for (size_t k = 0; k < server->cpr_hold_len; k++) out[o++] = server->cpr_hold[k];
+            server->cpr_hold_len = 0;
+            server->cpr_state = 0;
+            out[o++] = b;
+            i++;
+            continue;
           }
           break;
         case 2: // CSI start, optional '?'
@@ -650,7 +656,13 @@ static void shared_process_read_cb(pty_process *process, pty_buf_t *buf, bool eo
             server->cpr_state = 4; // seen '6', expect 'n'
             consumed = true;
           } else {
-            // Pre-flush already handled; fall through to normal copy
+            // Not part of CPR; flush introducer and copy current byte
+            for (size_t k = 0; k < server->cpr_hold_len; k++) out[o++] = server->cpr_hold[k];
+            server->cpr_hold_len = 0;
+            server->cpr_state = 0;
+            out[o++] = b;
+            i++;
+            continue;
           }
           break;
         case 3: // CSI + '?', expect '6'
@@ -659,7 +671,13 @@ static void shared_process_read_cb(pty_process *process, pty_buf_t *buf, bool eo
             server->cpr_state = 4;
             consumed = true;
           } else {
-            // Pre-flush already handled
+            // Not part of CPR; flush introducer and copy current byte
+            for (size_t k = 0; k < server->cpr_hold_len; k++) out[o++] = server->cpr_hold[k];
+            server->cpr_hold_len = 0;
+            server->cpr_state = 0;
+            out[o++] = b;
+            i++;
+            continue;
           }
           break;
         case 4: // CSI + (optional '?') + '6' seen, expect 'n' to complete request
@@ -681,7 +699,13 @@ static void shared_process_read_cb(pty_process *process, pty_buf_t *buf, bool eo
             server->cpr_state = 0;
             consumed = true;
           } else {
-            // Pre-flush already handled
+            // Not part of CPR; flush introducer and copy current byte
+            for (size_t k = 0; k < server->cpr_hold_len; k++) out[o++] = server->cpr_hold[k];
+            server->cpr_hold_len = 0;
+            server->cpr_state = 0;
+            out[o++] = b;
+            i++;
+            continue;
           }
           break;
       }
