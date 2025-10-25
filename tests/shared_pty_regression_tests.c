@@ -1242,6 +1242,85 @@ static bool test_csi_6_non_n_passthrough(void) {
   return true;
 }
 
+static bool test_esc_split_then_non_bracket_passthrough(void) {
+  reset_stub_state();
+  init_server(1);
+
+  struct pss_tty pss;
+  make_client(&pss, 0, true);
+
+  pty_ctx_t *ctx = NULL;
+  pty_process *process = make_shared_process(server, &ctx);
+  server->shared_process = process;
+  ASSERT_TRUE(init_tsm_screen(server, 80, 24), "tsm screen initialized");
+
+  // First chunk: ESC only (held across reads)
+  char *part1 = malloc(1);
+  part1[0] = '\x1b';
+  pty_buf_t *buf1 = pty_buf_init(part1, 1);
+  shared_process_read_cb(process, buf1, false);
+
+  ASSERT_TRUE(pss.pty_buf == NULL, "no broadcast on partial ESC");
+
+  // Second chunk: non-bracket bytes
+  char *part2 = malloc(2);
+  part2[0] = 'X';
+  part2[1] = 'Z';
+  pty_buf_t *buf2 = pty_buf_init(part2, 2);
+  shared_process_read_cb(process, buf2, false);
+
+  // Expect ESC followed by XZ delivered (length 3), because we flushed hold then copied current bytes
+  ASSERT_PTR_EQ(pss.pty_buf, buf2, "client received second buffer");
+  ASSERT_INT_EQ((int)pss.pty_buf->len, 3, "three bytes delivered after merge");
+  ASSERT_TRUE(pss.pty_buf->base[0] == '\x1b' && pss.pty_buf->base[1] == 'X' && pss.pty_buf->base[2] == 'Z',
+              "ESCXZ preserved across boundary");
+
+  free_client(&pss);
+  free_shared_process(process, false);
+  cleanup_tsm_screen(server);
+  teardown_server();
+  return true;
+}
+
+static bool test_csi_split_then_non_6_passthrough(void) {
+  reset_stub_state();
+  init_server(1);
+
+  struct pss_tty pss;
+  make_client(&pss, 0, true);
+
+  pty_ctx_t *ctx = NULL;
+  pty_process *process = make_shared_process(server, &ctx);
+  server->shared_process = process;
+  ASSERT_TRUE(init_tsm_screen(server, 80, 24), "tsm screen initialized");
+
+  // First chunk: ESC[
+  char *part1 = malloc(2);
+  part1[0] = '\x1b';
+  part1[1] = '[';
+  pty_buf_t *buf1 = pty_buf_init(part1, 2);
+  shared_process_read_cb(process, buf1, false);
+  ASSERT_TRUE(pss.pty_buf == NULL, "no broadcast for partial CSI start");
+
+  // Second chunk: 'A' 'B' (neither '?' nor '6')
+  char *part2 = malloc(2);
+  part2[0] = 'A';
+  part2[1] = 'B';
+  pty_buf_t *buf2 = pty_buf_init(part2, 2);
+  shared_process_read_cb(process, buf2, false);
+
+  ASSERT_PTR_EQ(pss.pty_buf, buf2, "client received second buffer");
+  ASSERT_INT_EQ((int)pss.pty_buf->len, 4, "length preserved with flushed ESC[");
+  ASSERT_TRUE(pss.pty_buf->base[0] == '\x1b' && pss.pty_buf->base[1] == '[' &&
+              pss.pty_buf->base[2] == 'A' && pss.pty_buf->base[3] == 'B', "ESC[AB preserved");
+
+  free_client(&pss);
+  free_shared_process(process, false);
+  cleanup_tsm_screen(server);
+  teardown_server();
+  return true;
+}
+
 // ---------------------------------------------------------------------------
 // Test runner
 // ---------------------------------------------------------------------------
@@ -1271,6 +1350,8 @@ int main(void) {
       {"csi_non_question_or_6_passthrough", test_csi_non_question_or_6_passthrough},
       {"csi_question_non_6_passthrough", test_csi_question_non_6_passthrough},
       {"csi_6_non_n_passthrough", test_csi_6_non_n_passthrough},
+      {"esc_split_then_non_bracket_passthrough", test_esc_split_then_non_bracket_passthrough},
+      {"csi_split_then_non_6_passthrough", test_csi_split_then_non_6_passthrough},
   };
 
   size_t passed = 0;

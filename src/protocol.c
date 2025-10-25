@@ -551,12 +551,42 @@ static void shared_process_read_cb(pty_process *process, pty_buf_t *buf, bool eo
   // Stateful CSI 6n (CPR) interception across reads when clients are attached
   if (server->active_client_count > 0 && buf->base != NULL && buf_len > 0) {
     const unsigned char *src = (const unsigned char *)buf->base;
-    unsigned char *dst = (unsigned char *)buf->base;
     size_t i = 0, o = 0;
+    size_t out_cap = buf_len + server->cpr_hold_len + 8; // small headroom
+    unsigned char *out = xmalloc(out_cap);
 
     while (i < buf_len) {
       unsigned char b = src[i];
       bool consumed = false;
+
+      // If a partial introducer was held across reads but the next byte does not
+      // continue a CPR request, flush the hold now without consuming the current byte.
+      if (server->cpr_hold_len > 0) {
+        bool continues = false;
+        switch (server->cpr_state) {
+          case 1: // expect '['
+            continues = (b == '[');
+            break;
+          case 2: // after CSI start, accept '?' or '6'
+            continues = (b == '?' || b == '6');
+            break;
+          case 3: // after CSI? expect '6'
+            continues = (b == '6');
+            break;
+          case 4: // after ...'6' expect 'n'
+            continues = (b == 'n');
+            break;
+          default:
+            continues = false;
+            break;
+        }
+        if (!continues) {
+          // Flush held introducer bytes to output and reset state; do NOT consume b
+          for (size_t k = 0; k < server->cpr_hold_len; k++) out[o++] = server->cpr_hold[k];
+          server->cpr_hold_len = 0;
+          server->cpr_state = 0;
+        }
+      }
 
       // First, suppress any complete CPR response present at current position
       if (b == 0x1B && (i + 1) < buf_len && src[i + 1] == '[') {
@@ -607,10 +637,7 @@ static void shared_process_read_cb(pty_process *process, pty_buf_t *buf, bool eo
             server->cpr_state = 2; // CSI start
             consumed = true;
           } else {
-            // Not a CSI; flush hold and current byte
-            for (size_t k = 0; k < server->cpr_hold_len; k++) dst[o++] = server->cpr_hold[k];
-            server->cpr_hold_len = 0;
-            server->cpr_state = 0;
+            // Should have been handled by pre-flush; treat as normal byte
           }
           break;
         case 2: // CSI start, optional '?'
@@ -623,10 +650,7 @@ static void shared_process_read_cb(pty_process *process, pty_buf_t *buf, bool eo
             server->cpr_state = 4; // seen '6', expect 'n'
             consumed = true;
           } else {
-            // Not a CPR request; flush hold
-            for (size_t k = 0; k < server->cpr_hold_len; k++) dst[o++] = server->cpr_hold[k];
-            server->cpr_hold_len = 0;
-            server->cpr_state = 0;
+            // Pre-flush already handled; fall through to normal copy
           }
           break;
         case 3: // CSI + '?', expect '6'
@@ -635,9 +659,7 @@ static void shared_process_read_cb(pty_process *process, pty_buf_t *buf, bool eo
             server->cpr_state = 4;
             consumed = true;
           } else {
-            for (size_t k = 0; k < server->cpr_hold_len; k++) dst[o++] = server->cpr_hold[k];
-            server->cpr_hold_len = 0;
-            server->cpr_state = 0;
+            // Pre-flush already handled
           }
           break;
         case 4: // CSI + (optional '?') + '6' seen, expect 'n' to complete request
@@ -659,17 +681,14 @@ static void shared_process_read_cb(pty_process *process, pty_buf_t *buf, bool eo
             server->cpr_state = 0;
             consumed = true;
           } else {
-            // Not 'n'; flush hold
-            for (size_t k = 0; k < server->cpr_hold_len; k++) dst[o++] = server->cpr_hold[k];
-            server->cpr_hold_len = 0;
-            server->cpr_state = 0;
+            // Pre-flush already handled
           }
           break;
       }
 
       if (!consumed) {
         // Default copy path
-        dst[o++] = b;
+        out[o++] = b;
         i++;
       } else {
         // consumed by state machine; advance input index
@@ -677,7 +696,9 @@ static void shared_process_read_cb(pty_process *process, pty_buf_t *buf, bool eo
       }
     }
 
-    // Update buffer length after filtering
+    // Replace buffer contents with filtered output
+    free(buf->base);
+    buf->base = (char *)out;
     buf->len = o;
     buf_len = o;
 
