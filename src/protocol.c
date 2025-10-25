@@ -544,6 +544,111 @@ static void shared_process_read_cb(pty_process *process, pty_buf_t *buf, bool eo
     lwsl_debug("Fed %zu bytes to libtsm VTE\n", buf_len);
   }
 
+  // Intercept terminal queries (CSI 6n - cursor position request) when clients are attached.
+  // We synthesize a CPR response using libtsm cursor position and prevent the request from
+  // reaching xterm.js to avoid double responses under high latency.
+  if (server->active_client_count > 0 && buf->base != NULL && buf_len > 0) {
+    const unsigned char *src = (const unsigned char *)buf->base;
+    unsigned char *dst = (unsigned char *)buf->base;
+    size_t i = 0, o = 0;
+
+    while (i < buf_len) {
+      size_t start = i;
+      bool is_csi = false;
+      bool is_esc_bracket = false;
+
+      if (src[i] == 0x9B) { // 8-bit CSI
+        is_csi = true;
+        i++;
+      } else if (src[i] == 0x1B && (i + 1) < buf_len && src[i + 1] == '[') { // ESC[
+        is_esc_bracket = true;
+        i += 2;
+      }
+
+      if (is_csi || is_esc_bracket) {
+        size_t j = i;
+        if (j < buf_len && src[j] == '?') j++; // optional '?'
+
+        // Check for DSR: CPR request "6n"
+        if ((j + 1) < buf_len && src[j] == '6' && src[j + 1] == 'n') {
+          // Synthesize CPR reply ESC[row;colR using libtsm screen cursor (1-based)
+          unsigned int cx = 1, cy = 1;
+          if (server->tsm_screen != NULL) {
+            cx = tsm_screen_get_cursor_x(server->tsm_screen) + 1;
+            cy = tsm_screen_get_cursor_y(server->tsm_screen) + 1;
+          }
+
+          char reply[32];
+          int rlen = snprintf(reply, sizeof(reply), "\x1b[%u;%uR", cy, cx);
+          if (rlen > 0 && rlen < (int)sizeof(reply) && server->shared_process != NULL) {
+            lwsl_debug("Intercepted CSI 6n, replying with ESC[%u;%uR and suppressing broadcast\n", cy, cx);
+            pty_write(server->shared_process, pty_buf_init(reply, (size_t)rlen));
+          }
+
+          // Skip the entire request sequence from outgoing buffer
+          i = j + 2; // past '6' 'n'
+          continue;
+        }
+
+        // Otherwise, not a CPR request: copy the introducer and continue scanning
+        // Copy original bytes from 'start' up to current i
+        size_t intro_len = i - start;
+        if (intro_len > 0) {
+          if (o + intro_len > buf_len) intro_len = buf_len - o; // guard
+          memcpy(dst + o, src + start, intro_len);
+          o += intro_len;
+        }
+        continue;
+      }
+
+      // Also filter out any CPR response that may get echoed (ESC[digits;digitsR or 0x9B...R)
+      if (src[i] == 0x1B && (i + 1) < buf_len && src[i + 1] == '[') {
+        size_t j = i + 2;
+        // digits
+        size_t d1 = j;
+        while (j < buf_len && src[j] >= '0' && src[j] <= '9') j++;
+        if (j > d1 && j < buf_len && src[j] == ';') {
+          j++;
+          size_t d2 = j;
+          while (j < buf_len && src[j] >= '0' && src[j] <= '9') j++;
+          if (j > d2 && j < buf_len && src[j] == 'R') {
+            // Suppress echoed CPR response
+            lwsl_debug("Suppressing echoed CPR response from broadcast\n");
+            i = j + 1;
+            continue;
+          }
+        }
+      } else if (src[i] == 0x9B) { // 8-bit CSI CPR response
+        size_t j = i + 1;
+        size_t d1 = j;
+        while (j < buf_len && src[j] >= '0' && src[j] <= '9') j++;
+        if (j > d1 && j < buf_len && src[j] == ';') {
+          j++;
+          size_t d2 = j;
+          while (j < buf_len && src[j] >= '0' && src[j] <= '9') j++;
+          if (j > d2 && j < buf_len && src[j] == 'R') {
+            lwsl_debug("Suppressing echoed CPR response from broadcast (8-bit)\n");
+            i = j + 1;
+            continue;
+          }
+        }
+      }
+
+      // Default: copy one byte and advance
+      dst[o++] = src[i++];
+    }
+
+    // Update buffer length after filtering
+    buf->len = o;
+    buf_len = o;
+
+    // If everything was filtered, drop this chunk
+    if (buf_len == 0) {
+      pty_buf_free(buf);
+      return;
+    }
+  }
+
   int soft_dropped = 0;
   
   // Broadcast to ALL connected clients using reference counting
@@ -809,63 +914,27 @@ static void tsm_log_cb(void *data, const char *file, int line, const char *fn,
   }
 }
 
-// Heuristic: does 'u8' look like a CPR (Cursor Position Report) response: ESC[row;colR or CSI row;col R
-static bool looks_like_cpr_response(const char *u8, size_t len) {
-  if (u8 == NULL || len < 4) return false;
-
-  size_t i = 0;
-  if ((unsigned char)u8[0] == 0x1b) {
-    if (len < 3 || u8[1] != '[') return false;
-    i = 2;
-  } else if ((unsigned char)u8[0] == 0x9b) {
-    i = 1;
-  } else {
-    return false;
-  }
-
-  // Optional '?'
-  if (i < len && u8[i] == '?') i++;
-
-  // row digits
-  size_t start_row = i;
-  while (i < len && u8[i] >= '0' && u8[i] <= '9') i++;
-  if (i == start_row) return false;
-
-  // semicolon
-  if (i >= len || u8[i] != ';') return false;
-  i++;
-
-  // col digits
-  size_t start_col = i;
-  while (i < len && u8[i] >= '0' && u8[i] <= '9') i++;
-  if (i == start_col) return false;
-
-  // trailing 'R' and no extra junk
-  if (i >= len || u8[i] != 'R') return false;
-  return (i == len - 1);
-}
-
 // libtsm write callback - sends data back to PTY (e.g., for responses to queries)
 static void tsm_write_cb(struct tsm_vte *vte, const char *u8, size_t len, void *data) {
   struct server *server = (struct server *)data;
-
-  bool is_cpr = looks_like_cpr_response(u8, len);
-
-  // Fast-path CPR responses even when a client is attached to avoid latency-induced timeouts.
-  // Otherwise, only respond when NO clients are attached.
-  if (server->shared_process != NULL && (is_cpr || server->active_client_count == 0)) {
-    if (is_cpr && server->active_client_count > 0) {
-      lwsl_debug("libtsm fast-path CPR response (%zu bytes) with clients attached\n", len);
-    } else if (server->active_client_count == 0) {
-      lwsl_debug("libtsm auto-responding to terminal query (%zu bytes) - no clients attached\n", len);
-    }
+  
+  // Only respond to terminal queries when NO clients are attached.
+  // This prevents TUI apps (like cursor) from timing out when they send cursor position
+  // queries (CSI 6n) before any web client has connected to provide a terminal emulator.
+  //
+  // When clients ARE attached, xterm.js in the browser handles all terminal queries,
+  // so we don't respond here to avoid:
+  // 1. Double responses (both libtsm and xterm.js responding)
+  // 2. Broadcasting escape sequences to all clients
+  if (server->active_client_count == 0 && server->shared_process != NULL) {
+    lwsl_debug("libtsm auto-responding to terminal query (%zu bytes) - no clients attached\n", len);
     pty_buf_t *response = pty_buf_init((char *)u8, len);
     int err = pty_write(server->shared_process, response);
     if (err) {
       lwsl_warn("Failed to write VTE response to PTY: %s (%s)\n", uv_err_name(err), uv_strerror(err));
     }
   }
-
+  
   (void)vte;  // Suppress unused parameter warning
 }
 
