@@ -558,6 +558,35 @@ static void shared_process_read_cb(pty_process *process, pty_buf_t *buf, bool eo
       unsigned char b = src[i];
       bool consumed = false;
 
+      // First, suppress any complete CPR response present at current position
+      if (b == 0x1B && (i + 1) < buf_len && src[i + 1] == '[') {
+        size_t j = i + 2, d1 = j;
+        while (j < buf_len && src[j] >= '0' && src[j] <= '9') j++;
+        if (j > d1 && j < buf_len && src[j] == ';') {
+          j++;
+          size_t d2 = j;
+          while (j < buf_len && src[j] >= '0' && src[j] <= '9') j++;
+          if (j > d2 && j < buf_len && src[j] == 'R') {
+            lwsl_debug("Suppressing CPR response from broadcast\n");
+            i = j + 1;
+            continue;
+          }
+        }
+      } else if (b == 0x9B) {
+        size_t j = i + 1, d1 = j;
+        while (j < buf_len && src[j] >= '0' && src[j] <= '9') j++;
+        if (j > d1 && j < buf_len && src[j] == ';') {
+          j++;
+          size_t d2 = j;
+          while (j < buf_len && src[j] >= '0' && src[j] <= '9') j++;
+          if (j > d2 && j < buf_len && src[j] == 'R') {
+            lwsl_debug("Suppressing CPR response from broadcast (8-bit)\n");
+            i = j + 1;
+            continue;
+          }
+        }
+      }
+
       switch (server->cpr_state) {
         case 0: // idle
           if (b == 0x1B) { // ESC
@@ -639,35 +668,6 @@ static void shared_process_read_cb(pty_process *process, pty_buf_t *buf, bool eo
       }
 
       if (!consumed) {
-        // Try to suppress CPR responses in the same buffer: ESC[digits;digitsR or 0x9B...R
-        if (b == 0x1B && (i + 1) < buf_len && src[i + 1] == '[') {
-          size_t j = i + 2, d1 = j;
-          while (j < buf_len && src[j] >= '0' && src[j] <= '9') j++;
-          if (j > d1 && j < buf_len && src[j] == ';') {
-            j++;
-            size_t d2 = j;
-            while (j < buf_len && src[j] >= '0' && src[j] <= '9') j++;
-            if (j > d2 && j < buf_len && src[j] == 'R') {
-              lwsl_debug("Suppressing echoed CPR response from broadcast\n");
-              i = j + 1;
-              continue;
-            }
-          }
-        } else if (b == 0x9B) {
-          size_t j = i + 1, d1 = j;
-          while (j < buf_len && src[j] >= '0' && src[j] <= '9') j++;
-          if (j > d1 && j < buf_len && src[j] == ';') {
-            j++;
-            size_t d2 = j;
-            while (j < buf_len && src[j] >= '0' && src[j] <= '9') j++;
-            if (j > d2 && j < buf_len && src[j] == 'R') {
-              lwsl_debug("Suppressing echoed CPR response from broadcast (8-bit)\n");
-              i = j + 1;
-              continue;
-            }
-          }
-        }
-
         // Default copy path
         dst[o++] = b;
         i++;

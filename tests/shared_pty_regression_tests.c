@@ -51,6 +51,11 @@ static unsigned char last_write_cmd = 0;
 static char last_write_payload[1024];
 static size_t last_write_payload_len = 0;
 
+// Capture PTY writes (e.g., synthesized CPR responses)
+static int pty_write_call_count = 0;
+static char last_pty_write_data[128];
+static size_t last_pty_write_len = 0;
+
 static void reset_stub_state(void) {
   writable_call_count = 0;
   cancel_service_calls = 0;
@@ -67,6 +72,9 @@ static void reset_stub_state(void) {
   last_write_cmd = 0;
   last_write_payload_len = 0;
   last_write_payload[0] = '\0';
+  pty_write_call_count = 0;
+  last_pty_write_len = 0;
+  last_pty_write_data[0] = '\0';
 }
 
 static void test_exit(int code) {
@@ -284,7 +292,16 @@ void pty_resume(pty_process *process) {
 
 int pty_write(pty_process *process, pty_buf_t *buf) {
   (void)process;
-  (void)buf;
+  if (buf != NULL && buf->base != NULL) {
+    size_t copy_len = buf->len < sizeof(last_pty_write_data) - 1 ? buf->len : sizeof(last_pty_write_data) - 1;
+    memcpy(last_pty_write_data, buf->base, copy_len);
+    last_pty_write_data[copy_len] = '\0';
+    last_pty_write_len = copy_len;
+  } else {
+    last_pty_write_len = 0;
+    last_pty_write_data[0] = '\0';
+  }
+  pty_write_call_count++;
   return 0;
 }
 
@@ -331,6 +348,8 @@ static void init_server(int capacity) {
   server->client_wsi_list = calloc((size_t)capacity, sizeof(struct lws *));
   server->session_columns = 120;
   server->session_rows = 32;
+  server->cpr_hold_len = 0;
+  server->cpr_state = 0;
 }
 
 static struct lws *make_client(struct pss_tty *pss, int slot, bool initialized) {
@@ -962,6 +981,132 @@ static bool test_global_cap_soft_drop(void) {
   return true;
 }
 
+static bool test_cpr_request_inline_intercepted(void) {
+  reset_stub_state();
+  init_server(1);
+
+  // Attach one initialized client
+  struct pss_tty pss;
+  make_client(&pss, 0, true);
+
+  // Provide a shared process and libtsm screen for cursor position
+  pty_ctx_t *ctx = NULL;
+  pty_process *process = make_shared_process(server, &ctx);
+  server->shared_process = process;
+  ASSERT_TRUE(init_tsm_screen(server, 80, 24), "tsm screen initialized");
+
+  // Build a buffer containing CSI 6n request followed by some text
+  const char *suffix = "after";
+  size_t suffix_len = strlen(suffix);
+  char *payload = malloc(2 + 2 + suffix_len); // ESC [ 6 n + suffix
+  size_t off = 0;
+  payload[off++] = '\x1b';
+  payload[off++] = '[';
+  payload[off++] = '6';
+  payload[off++] = 'n';
+  memcpy(payload + off, suffix, suffix_len);
+  off += suffix_len;
+  pty_buf_t *buf = pty_buf_init(payload, off);
+
+  // Read callback should synthesize a CPR reply and suppress the request from broadcast
+  shared_process_read_cb(process, buf, false);
+
+  ASSERT_INT_EQ(pty_write_call_count, 1, "CPR reply written to PTY once");
+  ASSERT_TRUE(last_pty_write_len > 0, "CPR payload captured");
+  ASSERT_TRUE(strstr(last_pty_write_data, "[1;1R") != NULL || last_pty_write_data[0] == '\x1b',
+              "reply looks like ESC[row;colR");
+
+  // Client should receive only the suffix (CPR request filtered out)
+  ASSERT_PTR_EQ(pss.pty_buf, buf, "client enqueued filtered buffer");
+  ASSERT_INT_EQ((int)pss.pty_buf->len, (int)suffix_len, "buffer length equals suffix");
+  ASSERT_TRUE(strncmp(pss.pty_buf->base, suffix, suffix_len) == 0, "suffix delivered to client");
+
+  // Clean up
+  free_client(&pss);
+  free_shared_process(process, false);
+  cleanup_tsm_screen(server);
+  teardown_server();
+  return true;
+}
+
+static bool test_cpr_request_split_over_buffers_intercepted(void) {
+  reset_stub_state();
+  init_server(1);
+
+  struct pss_tty pss;
+  make_client(&pss, 0, true);
+
+  pty_ctx_t *ctx = NULL;
+  pty_process *process = make_shared_process(server, &ctx);
+  server->shared_process = process;
+  ASSERT_TRUE(init_tsm_screen(server, 80, 24), "tsm screen initialized");
+
+  // First chunk: ESC [ 6
+  char *part1 = malloc(3);
+  part1[0] = '\x1b';
+  part1[1] = '[';
+  part1[2] = '6';
+  pty_buf_t *buf1 = pty_buf_init(part1, 3);
+  shared_process_read_cb(process, buf1, false);
+
+  // No CPR write yet, and nothing broadcast
+  ASSERT_INT_EQ(pty_write_call_count, 0, "no CPR reply yet (awaiting 'n')");
+  ASSERT_TRUE(pss.pty_buf == NULL, "no broadcast for partial CPR sequence");
+
+  // Second chunk: 'n' + visible payload
+  const char *tail = "done";
+  size_t tail_len = strlen(tail);
+  char *part2 = malloc(1 + tail_len);
+  part2[0] = 'n';
+  memcpy(part2 + 1, tail, tail_len);
+  pty_buf_t *buf2 = pty_buf_init(part2, 1 + tail_len);
+  shared_process_read_cb(process, buf2, false);
+
+  // Now CPR should be replied to once, and client receives only the tail
+  ASSERT_INT_EQ(pty_write_call_count, 1, "CPR reply issued when sequence completed");
+  ASSERT_PTR_EQ(pss.pty_buf, buf2, "client received second buffer");
+  ASSERT_INT_EQ((int)pss.pty_buf->len, (int)tail_len, "only tail length delivered");
+  ASSERT_TRUE(strncmp(pss.pty_buf->base, tail, tail_len) == 0, "tail delivered to client");
+
+  free_client(&pss);
+  free_shared_process(process, false);
+  cleanup_tsm_screen(server);
+  teardown_server();
+  return true;
+}
+
+static bool test_cpr_response_suppressed_from_broadcast(void) {
+  reset_stub_state();
+  init_server(1);
+
+  struct pss_tty pss;
+  make_client(&pss, 0, true);
+
+  pty_ctx_t *ctx = NULL;
+  pty_process *process = make_shared_process(server, &ctx);
+  server->shared_process = process;
+  ASSERT_TRUE(init_tsm_screen(server, 80, 24), "tsm screen initialized");
+
+  // Craft a buffer containing a CPR response ESC[1;1R followed by 'X'
+  const char *after = "X";
+  char *payload = malloc(6 + strlen(after));
+  memcpy(payload, "\x1b[1;1R", 6);
+  memcpy(payload + 6, after, strlen(after));
+  pty_buf_t *buf = pty_buf_init(payload, 6 + strlen(after));
+  shared_process_read_cb(process, buf, false);
+
+  // Client should only receive 'X' (CPR response suppressed)
+  ASSERT_PTR_EQ(pss.pty_buf, buf, "client enqueued filtered buffer");
+  ASSERT_INT_EQ((int)pss.pty_buf->len, 1, "length == 1 after suppression");
+  ASSERT_TRUE(pss.pty_buf->base[0] == 'X', "only trailing byte delivered");
+
+  free_client(&pss);
+  free_shared_process(process, false);
+  cleanup_tsm_screen(server);
+  teardown_server();
+  return true;
+}
+
 // ---------------------------------------------------------------------------
 // Test runner
 // ---------------------------------------------------------------------------
@@ -984,6 +1129,9 @@ int main(void) {
       {"client_resize_request_reasserts_geometry", test_client_resize_request_reasserts_geometry},
       {"once_flag_triggers_teardown", test_once_flag_triggers_teardown},
       {"global_cap_soft_drop", test_global_cap_soft_drop},
+      {"cpr_request_inline_intercepted", test_cpr_request_inline_intercepted},
+      {"cpr_request_split_over_buffers_intercepted", test_cpr_request_split_over_buffers_intercepted},
+      {"cpr_response_suppressed_from_broadcast", test_cpr_response_suppressed_from_broadcast},
   };
 
   size_t passed = 0;
