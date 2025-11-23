@@ -694,10 +694,7 @@ static void shared_process_read_cb(pty_process *process, pty_buf_t *buf, bool eo
               lwsl_debug("Intercepted CSI 6n, replying with ESC[%u;%uR and suppressing broadcast\n", cy, cx);
               pty_write(server->shared_process, pty_buf_init(reply, (size_t)rlen));
             }
-            // Reset state; do not copy the sequence
-            server->cpr_hold_len = 0;
-            server->cpr_state = 0;
-            consumed = true;
+
           } else {
             // Not part of CPR; flush introducer and copy current byte
             for (size_t k = 0; k < server->cpr_hold_len; k++) out[o++] = server->cpr_hold[k];
